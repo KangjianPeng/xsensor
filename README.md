@@ -6,19 +6,18 @@ XSensor is a desktop application built with Rust and Dioxus for monitoring and c
 
 - **BLE Connectivity**:
   - Automatic scanning for compatible devices.
-  - **Auto-Connect**: Automatically connects to devices broadcasting the target service UUID (`0000ffe0...`).
+  - Stable scan results that can be selected manually while scanning.
   - Real-time connection status and signal strength (RSSI) monitoring.
 
 - **Real-time Status**:
   - Visualizes sensor data streams.
+  - Reads PS values from the XSensor profile and follows its configured refresh frequency (0–15 Hz, where 0 stops periodic updates).
+  - Reads and subscribes to the standard BLE Battery Service.
   - **Smart Counting**: Implements logic to filter signal bounce and release events, ensuring accurate event counting.
 
 - **Parameter Configuration**:
   - Read and write device parameters wirelessly.
-  - Configurable thresholds:
-    - Low Pressure Threshold
-    - High Pressure Threshold
-    - Acceleration Threshold
+  - Configures the low and high PS thresholds and the UTF-8 BLE device name (up to 20 bytes).
 
 ## Tech Stack
 
@@ -57,5 +56,5 @@ dx serve --platform desktop
 
 ## Development Notes
 
-- **Auto-Connect**: The application is configured to automatically connect to the first discovered device that advertises the service UUID `0000ffe0-0000-1000-8000-00805f9b34fb`.
+- **Connection flow**: Scanning only discovers devices. Start a connection by clicking the device row's connection button.
 - **Counter Logic**: The status view ignores `0` values from the notification stream to prevent double-counting on button release.

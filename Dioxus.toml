@@ -24,4 +24,4 @@ script = []
 [bundle]
 identifier = "com.pkjinfinity.xsensor"
 publisher = "pkjinfinity"
-icon = ["icons/icon.ico"]
+icon = ["icons/icon.ico", "icons/icon.png"]

@@ -5,8 +5,11 @@ use futures::channel::oneshot;
 use futures::Stream;
 use futures::StreamExt;
 use std::pin::Pin;
+
+type DeviceStream = Pin<Box<dyn Stream<Item = Vec<UiDevice>> + Send>>;
+type NotificationStream = Pin<Box<dyn Stream<Item = NotificationData> + Send>>;
 pub enum BleRequest {
-    Scan(oneshot::Sender<Result<Pin<Box<dyn Stream<Item = Vec<UiDevice>> + Send>>, String>>),
+    Scan(oneshot::Sender<Result<DeviceStream, String>>),
     GetDevices(oneshot::Sender<Vec<UiDevice>>),
     Connect(String, oneshot::Sender<Result<(), String>>),
     Disconnect(String, oneshot::Sender<Result<(), String>>),
@@ -28,7 +31,7 @@ pub enum BleRequest {
         String, // device_id
         String, // service_uuid
         String, // char_uuid
-        oneshot::Sender<Result<Pin<Box<dyn Stream<Item = NotificationData> + Send>>, String>>,
+        oneshot::Sender<Result<NotificationStream, String>>,
     ),
     ListCharacteristics(String, oneshot::Sender<Result<Vec<UiService>, String>>),
     StopScan(oneshot::Sender<Result<(), String>>),
@@ -40,7 +43,7 @@ pub struct BleService {
 }
 
 impl BleService {
-    pub async fn scan(&self) -> Result<Pin<Box<dyn Stream<Item = Vec<UiDevice>> + Send>>, String> {
+    pub async fn scan(&self) -> Result<DeviceStream, String> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(BleRequest::Scan(tx));
         rx.await.map_err(|_| "Channel closed".to_string())?
@@ -109,7 +112,7 @@ impl BleService {
         id: &str,
         service: &str,
         characteristic: &str,
-    ) -> Result<Pin<Box<dyn Stream<Item = NotificationData> + Send>>, String> {
+    ) -> Result<NotificationStream, String> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(BleRequest::Subscribe(
             id.to_string(),
@@ -138,16 +141,14 @@ pub fn use_ble_provider() {
         let mut manager = BleManager::new();
         while let Some(msg) = rx.next().await {
             match msg {
-                BleRequest::Scan(reply) => {
-                    match manager.start_scan_stream().await {
-                        Ok(stream) => {
-                            let _ = reply.send(Ok(Box::pin(stream)));
-                        }
-                        Err(e) => {
-                            let _ = reply.send(Err(e.to_string()));
-                        }
+                BleRequest::Scan(reply) => match manager.start_scan_stream().await {
+                    Ok(stream) => {
+                        let _ = reply.send(Ok(Box::pin(stream)));
                     }
-                }
+                    Err(e) => {
+                        let _ = reply.send(Err(e.to_string()));
+                    }
+                },
                 BleRequest::GetDevices(reply) => {
                     let _ = reply.send(manager.get_devices().await.unwrap_or_default());
                 }

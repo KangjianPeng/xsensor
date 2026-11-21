@@ -21,7 +21,11 @@ impl Theme {
 
     /// 根据主题选择对应值
     pub fn pick<T: Clone>(&self, dark: T, light: T) -> T {
-        if self.is_dark() { dark } else { light }
+        if self.is_dark() {
+            dark
+        } else {
+            light
+        }
     }
 }
 
@@ -35,7 +39,7 @@ pub struct AppState {
 }
 
 pub fn use_app_state_provider() {
-    let connected_device_id = use_signal(|| String::new());
+    let connected_device_id = use_signal(String::new);
     let scanned_devices = use_signal(Vec::new);
     let is_scanning = use_signal(|| false);
     let is_connecting = use_signal(|| false);

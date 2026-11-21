@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">XSensor</title>
+  <desc id="desc">A lime sensor pulse inside a rounded dark square</desc>
+  <defs>
+    <linearGradient id="background" x1="64" y1="32" x2="448" y2="480" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#172332"/>
+      <stop offset="1" stop-color="#0b111c"/>
+    </linearGradient>
+    <linearGradient id="pulse" x1="122" y1="256" x2="390" y2="256" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#b8f36b"/>
+      <stop offset="1" stop-color="#5ed7d2"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#background)"/>
+  <rect x="17.5" y="17.5" width="477" height="477" rx="110.5" fill="none" stroke="#31445a" stroke-width="3"/>
+  <path d="M92 256h74l30-82 48 164 42-122 25 40h109" fill="none" stroke="#203447" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M92 256h74l30-82 48 164 42-122 25 40h109" fill="none" stroke="url(#pulse)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
+  <circle cx="92" cy="256" r="12" fill="#b8f36b"/>
+  <circle cx="420" cy="256" r="12" fill="#5ed7d2"/>
+  <path d="M256 92v42M256 378v42M92 256h42M378 256h42" stroke="#49627c" stroke-width="8" stroke-linecap="round" opacity=".7"/>
+  <circle cx="256" cy="256" r="22" fill="#101b29" stroke="#b8f36b" stroke-width="8"/>
+</svg>

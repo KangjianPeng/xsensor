@@ -6,29 +6,34 @@ use dioxus_free_icons::icons::fa_solid_icons::{
 };
 use dioxus_free_icons::Icon;
 
+const APP_ICON: Asset = asset!("/assets/icon.svg");
+
 #[component]
 pub fn TitleBar() -> Element {
     let mut app_state = use_app_state();
-    let theme = app_state.theme.read().clone();
+    let theme = *app_state.theme.read();
     // 跟踪最大化状态（初始值读取窗口实际状态）
     let mut is_maximized = use_signal(|| window().window.is_maximized());
 
-    let title_bar_bg     = theme.pick("bg-[#1a1a1a]", "bg-[#e8e8e8]");
+    let title_bar_bg = theme.pick("bg-[#0a1320]", "bg-[#f8fafb]");
     let title_text_color = theme.pick("text-gray-100", "text-gray-800");
-    let title_bar_border = theme.pick("border-[#2a2a2a]", "border-[#d0d0d0]");
-    let btn_hover        = theme.pick("hover:bg-[#3a3a3a]", "hover:bg-[#cccccc]");
-    let close_hover      = "hover:bg-red-500 hover:text-white";
+    let title_bar_border = theme.pick("border-white/10", "border-slate-200");
+    let btn_hover = theme.pick("hover:bg-white/10", "hover:bg-slate-200");
+    let close_hover = "hover:bg-red-500 hover:text-white";
 
     rsx! {
-        div { class: "flex items-center justify-between h-9 px-3 select-none {title_bar_bg} {title_text_color} border-b {title_bar_border}",
+        div { class: "flex items-center justify-between h-10 px-3 select-none {title_bar_bg} {title_text_color} border-b {title_bar_border}",
             // 拖拽区域：app 图标 + 标题
             div {
-                class: "flex items-center gap-2 flex-1 min-w-0 cursor-default",
+                class: "flex items-center gap-2.5 flex-1 min-w-0 cursor-default",
                 onmousedown: move |_| {
                     window().drag();
                 },
-                div { class: "w-3 h-3 rounded-full bg-[#60cd18] shrink-0" }
-                span { class: "text-xs font-semibold tracking-wide truncate", "XSensor" }
+                img { class: "w-6 h-6 rounded-md", src: APP_ICON, alt: "XSensor" }
+                div {
+                    span { class: "text-xs font-semibold tracking-wide truncate", "XSensor" }
+                    span { class: "ml-2 text-[10px] text-slate-400", "EDGE SENSOR CONSOLE" }
+                }
             }
 
             // 右侧按钮组

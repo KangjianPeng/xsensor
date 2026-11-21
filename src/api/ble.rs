@@ -1,4 +1,4 @@
-use crate::api::{NotificationData, UiCharacteristic, UiDevice, UiService};
+use crate::api::{characteristic_name, NotificationData, UiCharacteristic, UiDevice, UiService};
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use dioxus::prelude::info;
@@ -68,7 +68,7 @@ impl BleManager {
             let name = props
                 .as_ref()
                 .and_then(|x| x.local_name.clone())
-                .unwrap_or_else(|| "Unknow".to_string());
+                .unwrap_or_else(|| "未知设备".to_string());
             let rssi = props.as_ref().and_then(|x| x.rssi);
             let services = props
                 .as_ref()
@@ -85,13 +85,9 @@ impl BleManager {
             });
         }
 
-        p_list.sort_by(|a, b| {
-            b.is_connected.cmp(&a.is_connected).then_with(|| {
-                let a_rssi = a.rssi.unwrap_or(i16::MIN);
-                let b_rssi = b.rssi.unwrap_or(i16::MIN);
-                b_rssi.cmp(&a_rssi)
-            })
-        });
+        // Keep device rows in one deterministic order. Connection state and RSSI
+        // change while scanning and must not move a row under the pointer.
+        p_list.sort_by(|a, b| a.id.cmp(&b.id));
         p_list
     }
 
@@ -113,22 +109,24 @@ impl BleManager {
 
         let adapter_clone = adapter.clone();
 
-        // Stream 1: Events triggering updates
-        let event_updates = events.map(|e| {
-            if let CentralEvent::DeviceDiscovered(_) = e {
-                info!("BLE Event: DeviceDiscovered");
-            }
-            ()
-        });
-
-        // Stream 2: Periodic updates (fallback)
-        let timer_updates = futures::stream::unfold((), |_| async move {
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-            Some(((), ()))
-        });
-
-        // Merge streams
-        let updates = futures::stream::select(event_updates, timer_updates);
+        let mut refresh_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        refresh_interval.tick().await;
+        let updates = futures::stream::unfold(
+            (events, refresh_interval),
+            |(mut events, mut refresh_interval)| async move {
+                loop {
+                    tokio::select! {
+                        _ = refresh_interval.tick() => break,
+                        Some(event) = events.next() => {
+                            if let CentralEvent::DeviceDiscovered(_) = event {
+                                info!("BLE Event: DeviceDiscovered");
+                            }
+                        }
+                    }
+                }
+                Some(((), (events, refresh_interval)))
+            },
+        );
 
         let stream = updates.then(move |_| {
             let adapter = adapter_clone.clone();
@@ -137,7 +135,8 @@ impl BleManager {
 
         // Fetch immediately once
         let initial_adapter = adapter.clone();
-        let initial = futures::stream::once(async move { Self::fetch_devices(&initial_adapter).await });
+        let initial =
+            futures::stream::once(async move { Self::fetch_devices(&initial_adapter).await });
 
         self.is_scanning = true;
         Ok(initial.chain(stream))
@@ -174,7 +173,7 @@ impl BleManager {
             let name = props
                 .as_ref()
                 .and_then(|x| x.local_name.clone())
-                .unwrap_or_else(|| "Unknow".to_string());
+                .unwrap_or_else(|| "未知设备".to_string());
             let rssi = props.as_ref().and_then(|x| x.rssi);
             let services = props
                 .as_ref()
@@ -182,19 +181,15 @@ impl BleManager {
                 .unwrap_or_default();
             let is_connected = p.is_connected().await.unwrap_or_default();
 
-            if is_connected {
-                // Always update connected_peripherals with the fresh instance
+            // Windows can briefly report false while service discovery is
+            // still completing, so only replace the connection cache when a
+            // peripheral is confirmed connected. The connection watchdog and
+            // explicit disconnect path remove stale entries.
+            if is_connected && !self.connected_peripherals.contains_key(id) {
+                // Keep the instance that completed service discovery. Replacing it
+                // with the scan snapshot can drop the characteristic cache while
+                // the status page is polling or receiving notifications.
                 self.connected_peripherals.insert(id.clone(), p.clone());
-                
-                // Ensure services are discovered if not already
-                // We can't easily check if services are discovered without locking, 
-                // but discover_services is usually idempotent or cheap if already done.
-                // However, to avoid spamming, we might want to be careful.
-                // For now, let's trust that refresh_peripheral handles the heavy lifting if needed.
-            } else {
-                if self.connected_peripherals.contains_key(id) {
-                    self.connected_peripherals.remove(id);
-                }
             }
 
             p_list.push(UiDevice {
@@ -206,14 +201,9 @@ impl BleManager {
             });
         }
 
-        // Sort: connected devices first, then by RSSI (strongest first, unknown last).
-        p_list.sort_by(|a, b| {
-            b.is_connected.cmp(&a.is_connected).then_with(|| {
-                let a_rssi = a.rssi.unwrap_or(i16::MIN);
-                let b_rssi = b.rssi.unwrap_or(i16::MIN);
-                b_rssi.cmp(&a_rssi)
-            })
-        });
+        // Keep device rows in one deterministic order. Connection state and RSSI
+        // change while scanning and must not move a row under the pointer.
+        p_list.sort_by(|a, b| a.id.cmp(&b.id));
 
         Ok(p_list)
     }
@@ -224,27 +214,34 @@ impl BleManager {
             .peripherals()
             .await
             .map_err(|e| BleError::new(e.to_string()))?;
-            
+
         let p = peripherals
             .into_iter()
             .find(|p| p.id().to_string() == id)
             .map(Arc::new)
             .or_else(|| self.known_peripherals.get(&id).cloned())
             .ok_or(BleError::new("Device not found"))?;
-        
-        p.connect().await.map_err(|e| BleError::new(e.to_string()))?;
-        
-        // Spawn discovery in background to speed up connection status update
-        let p_clone = p.clone();
-        tokio::spawn(async move {
-            if let Err(e) = p_clone.discover_services().await {
-                dioxus::prelude::error!("Failed to discover services: {}", e);
-            }
-        });
-        
+
+        p.connect()
+            .await
+            .map_err(|e| BleError::new(e.to_string()))?;
+
+        // Complete discovery before exposing the connection to the views. This
+        // prevents the first PS reads from racing the Windows service cache.
+        if let Err(error) = p.discover_services().await {
+            let cleanup_error = p.disconnect().await.err();
+            let message = match cleanup_error {
+                Some(cleanup_error) => {
+                    format!("Service discovery failed: {error}; disconnect failed: {cleanup_error}")
+                }
+                None => format!("Service discovery failed: {error}"),
+            };
+            return Err(BleError::new(message));
+        }
+
         self.known_peripherals.insert(id.clone(), p.clone());
         self.connected_peripherals.insert(id, p);
-        
+
         Ok(())
     }
 
@@ -267,7 +264,10 @@ impl BleManager {
         service_uuid: &str,
         char_uuid: &str,
     ) -> Result<(Arc<Peripheral>, btleplug::api::Characteristic), BleError> {
-        let p = self.connected_peripherals.get(peri_id).cloned()
+        let p = self
+            .connected_peripherals
+            .get(peri_id)
+            .cloned()
             .ok_or(BleError::new("Device not connected"))?;
 
         let service_uuid_obj = Uuid::from_str(service_uuid)
@@ -294,16 +294,23 @@ impl BleManager {
             .peripherals()
             .await
             .map_err(|e| BleError::new(e.to_string()))?;
-        
-        if let Some(fresh_p) = peripherals.into_iter().find(|p| p.id().to_string() == peri_id) {
+
+        if let Some(fresh_p) = peripherals
+            .into_iter()
+            .find(|p| p.id().to_string() == peri_id)
+        {
             let fresh_p = Arc::new(fresh_p);
             // 检查是否已连接
             if fresh_p.is_connected().await.unwrap_or(false) {
-                self.known_peripherals.insert(peri_id.to_string(), fresh_p.clone());
-                self.connected_peripherals.insert(peri_id.to_string(), fresh_p.clone());
+                self.known_peripherals
+                    .insert(peri_id.to_string(), fresh_p.clone());
+                self.connected_peripherals
+                    .insert(peri_id.to_string(), fresh_p.clone());
                 // 确保服务已发现
                 if fresh_p.services().is_empty() {
-                    fresh_p.discover_services().await
+                    fresh_p
+                        .discover_services()
+                        .await
                         .map_err(|e| BleError::new(e.to_string()))?;
                 }
                 return Ok(());
@@ -318,11 +325,15 @@ impl BleManager {
         service_uuid: &str,
         char_uuid: &str,
     ) -> Result<Vec<u8>, BleError> {
-        let (p, char) = match self.get_characteristic(peri_id, service_uuid, char_uuid).await {
+        let (p, char) = match self
+            .get_characteristic(peri_id, service_uuid, char_uuid)
+            .await
+        {
             Ok(res) => res,
             Err(_) => {
                 self.refresh_peripheral(peri_id).await?;
-                self.get_characteristic(peri_id, service_uuid, char_uuid).await?
+                self.get_characteristic(peri_id, service_uuid, char_uuid)
+                    .await?
             }
         };
 
@@ -330,8 +341,12 @@ impl BleManager {
             Ok(data) => Ok(data),
             Err(_) => {
                 self.refresh_peripheral(peri_id).await?;
-                let (p, char) = self.get_characteristic(peri_id, service_uuid, char_uuid).await?;
-                p.read(&char).await.map_err(|e| BleError::new(e.to_string()))
+                let (p, char) = self
+                    .get_characteristic(peri_id, service_uuid, char_uuid)
+                    .await?;
+                p.read(&char)
+                    .await
+                    .map_err(|e| BleError::new(e.to_string()))
             }
         }
     }
@@ -343,11 +358,15 @@ impl BleManager {
         char_uuid: &str,
         value: Vec<u8>,
     ) -> Result<(), BleError> {
-        let (p, char) = match self.get_characteristic(peri_id, service_uuid, char_uuid).await {
+        let (p, char) = match self
+            .get_characteristic(peri_id, service_uuid, char_uuid)
+            .await
+        {
             Ok(res) => res,
             Err(_) => {
                 self.refresh_peripheral(peri_id).await?;
-                self.get_characteristic(peri_id, service_uuid, char_uuid).await?
+                self.get_characteristic(peri_id, service_uuid, char_uuid)
+                    .await?
             }
         };
 
@@ -355,7 +374,9 @@ impl BleManager {
             Ok(_) => Ok(()),
             Err(_) => {
                 self.refresh_peripheral(peri_id).await?;
-                let (p, char) = self.get_characteristic(peri_id, service_uuid, char_uuid).await?;
+                let (p, char) = self
+                    .get_characteristic(peri_id, service_uuid, char_uuid)
+                    .await?;
                 p.write(&char, &value, WriteType::WithResponse)
                     .await
                     .map_err(|e| BleError::new(e.to_string()))
@@ -370,26 +391,32 @@ impl BleManager {
         char_uuid: &str,
     ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = NotificationData> + Send>>, BleError>
     {
-        let (p, char) = if let Ok((p, char)) = self.get_characteristic(id, service_uuid, char_uuid).await {
-             if p.subscribe(&char).await.is_ok() {
-                 (p, char)
-             } else {
-                 self.refresh_peripheral(id).await?;
-                 let (p, char) = self.get_characteristic(id, service_uuid, char_uuid).await?;
-                 p.subscribe(&char).await.map_err(|e| BleError::new(e.to_string()))?;
-                 (p, char)
-             }
-        } else {
-             self.refresh_peripheral(id).await?;
-             let (p, char) = self.get_characteristic(id, service_uuid, char_uuid).await?;
-             p.subscribe(&char).await.map_err(|e| BleError::new(e.to_string()))?;
-             (p, char)
+        let (p, char) = match self.get_characteristic(id, service_uuid, char_uuid).await {
+            Ok(characteristic) => characteristic,
+            Err(_) => {
+                self.refresh_peripheral(id).await?;
+                self.get_characteristic(id, service_uuid, char_uuid).await?
+            }
         };
 
-        let s = p
+        // Register the notification stream before subscribing so the first value is not lost.
+        let mut s = p
             .notifications()
             .await
             .map_err(|e| BleError::new(e.to_string()))?;
+        if p.subscribe(&char).await.is_err() {
+            self.refresh_peripheral(id).await?;
+            let (refreshed_p, refreshed_char) =
+                self.get_characteristic(id, service_uuid, char_uuid).await?;
+            s = refreshed_p
+                .notifications()
+                .await
+                .map_err(|e| BleError::new(e.to_string()))?;
+            refreshed_p
+                .subscribe(&refreshed_char)
+                .await
+                .map_err(|e| BleError::new(e.to_string()))?;
+        }
 
         let target_uuid = char.uuid;
         Ok(Box::pin(
@@ -432,6 +459,7 @@ impl BleManager {
             for char in service.characteristics {
                 ui_chars.push(UiCharacteristic {
                     uuid: char.uuid.to_string(),
+                    name: characteristic_name(&char.uuid.to_string()).to_string(),
                     service_uuid: service.uuid.to_string(),
                     property: crate::api::prop_flags_to_vec(char.properties),
                 });
@@ -453,6 +481,7 @@ pub fn get_service_name(uuid: &str) -> &str {
         "0000180a-0000-1000-8000-00805f9b34fb" => "Device Information",
         "0000180f-0000-1000-8000-00805f9b34fb" => "Battery Service",
         "00001802-0000-1000-8000-00805f9b34fb" => "Immediate Alert",
+        "0000ffe0-0000-1000-8000-00805f9b34fb" => "XSensor Proximity Sensor",
         _ => "Unknown Service",
     }
 }
