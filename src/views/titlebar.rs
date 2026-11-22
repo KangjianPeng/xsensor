@@ -30,10 +30,7 @@ pub fn TitleBar() -> Element {
                     window().drag();
                 },
                 img { class: "w-6 h-6 rounded-md", src: APP_ICON, alt: "XSensor" }
-                div {
-                    span { class: "text-xs font-semibold tracking-wide truncate", "XSensor" }
-                    span { class: "ml-2 text-[10px] text-slate-400", "EDGE SENSOR CONSOLE" }
-                }
+                span { class: "text-xs font-semibold tracking-wide truncate", "XSensor" }
             }
 
             // 右侧按钮组

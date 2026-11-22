@@ -4,144 +4,51 @@ use crate::ble_constants::{
     RELOAD_INT_UUID, SERVICE_UUID,
 };
 use crate::context::use_app_state;
-use dioxus::prelude::*;
+use dioxus::{core::Task, prelude::*};
 use futures::StreamExt;
+use std::time::Duration;
+use tokio::time::{timeout_at, Instant};
 
-// FFE7 is a two-byte value. Keep the complete u16 range so values whose high
-// byte is non-zero are displayed instead of being folded back to zero.
-const PS_CHART_BASE_MAX: u16 = 0x0fff;
+const DEFAULT_POLL_HZ: i32 = 5;
+const READ_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SUBSCRIBE_RETRY_DELAY: Duration = Duration::from_secs(3);
+const FREQUENCY_WRITE_DELAY: Duration = Duration::from_millis(500);
 
 #[component]
 pub fn Status() -> Element {
     let app_state = use_app_state();
-    let ble = use_ble();
     let device_id = app_state.connected_device_id.read().clone();
+    let theme = (app_state.theme)();
 
+    rsx! {
+        div {
+            class: theme.pick(
+                "app-scroll h-full w-full text-gray-100 overflow-auto relative",
+                "app-scroll h-full w-full text-gray-900 overflow-auto relative",
+            ),
+            if device_id.is_empty() {
+                StatusEmptyState {}
+            } else {
+                ConnectedStatus { key: "{device_id}", device_id }
+            }
+        }
+    }
+}
+
+#[component]
+fn ConnectedStatus(device_id: String) -> Element {
+    let ble = use_ble();
     let mut battery_level = use_signal(|| 0);
-    // Start with no samples. A synthetic zero history makes an unavailable
-    // sensor look like it is returning a real value of zero.
-    let mut sensor_data_1 = use_signal(Vec::<u16>::new); // PS Data (FFE7, two-byte value)
-    let mut trigger_count_1 = use_signal(|| 0); // PS Interrupt
-    let mut trigger_active_1 = use_signal(|| false);
-    let mut trigger_count_2 = use_signal(|| 0); // Reload Interrupt
-    let mut trigger_active_2 = use_signal(|| false);
-    let mut ps_refresh_freq = use_signal(|| 5); // 刷新频率
-    let mut is_loaded = use_signal(|| false);
+    let mut ps_samples = use_signal(Vec::<u16>::new);
+    let mut ps_error = use_signal(|| None::<String>);
+    let mut ps_frequency = use_signal(|| None::<i32>);
+    let mut frequency_error = use_signal(|| None::<String>);
+    let mut frequency_input = use_signal(|| None::<String>);
 
-    // 取消标志：组件卸载时设为 true，让所有后台订阅任务退出
-    // use_resource 创建的任务并不随组件卸载而自动取消，
-    // 使用 use_hook 存储 DropGuard，在 scope drop 时触发清理
-    let cancelled = use_signal(|| false);
-    use_hook(|| {
-        // Clone 返回 active=false 副本，这样 use_hook 返回的克隆被丢弃时不会迎早触发取消。
-        // 只有 use_hook 中存储的原始实例（active=true）在 scope 释放时才进行清理。
-        struct DropGuard {
-            sig: Signal<bool>,
-            active: bool,
-        }
-        impl Clone for DropGuard {
-            fn clone(&self) -> Self {
-                DropGuard {
-                    sig: self.sig,
-                    active: false,
-                }
-            }
-        }
-        impl Drop for DropGuard {
-            fn drop(&mut self) {
-                if self.active {
-                    self.sig.set(true);
-                }
-            }
-        }
-        DropGuard {
-            sig: cancelled,
-            active: true,
-        }
-    });
-
-    let connected_device_id = app_state.connected_device_id;
-    let write_ps_freq_task = use_coroutine(move |mut rx: UnboundedReceiver<i32>| async move {
-        while let Some(new_val) = rx.next().await {
-            let id = connected_device_id.read().clone();
-            if id.is_empty() {
-                error!("Cannot write PS frequency without a connected device");
-                continue;
-            }
-            let freq_byte = new_val.clamp(0, PS_FREQ_MAX) as u8;
-            if let Err(e) = ble
-                .write(&id, SERVICE_UUID, PS_FREQ_UUID, vec![freq_byte])
-                .await
-            {
-                error!("Failed to write PS freq: {}", e);
-            }
-        }
-    });
-    let on_ps_freq_change = move |new_val: i32| {
-        ps_refresh_freq.set(new_val);
-        write_ps_freq_task.send(new_val);
-    };
-
-    // 读取刷新频率和电池电量
-    use_resource(move || {
-        let id = app_state.connected_device_id.read().clone();
+    let id = device_id.clone();
+    use_future(move || {
+        let id = id.clone();
         async move {
-            if id.is_empty() {
-                battery_level.set(0);
-                sensor_data_1.set(Vec::new());
-                trigger_count_1.set(0);
-                trigger_count_2.set(0);
-                trigger_active_1.set(false);
-                trigger_active_2.set(false);
-                is_loaded.set(false);
-                return;
-            }
-
-            battery_level.set(0);
-            sensor_data_1.set(Vec::new());
-            trigger_count_1.set(0);
-            trigger_count_2.set(0);
-            trigger_active_1.set(false);
-            trigger_active_2.set(false);
-            ps_refresh_freq.set(5);
-            is_loaded.set(false);
-
-            // Wait for services to be discovered
-            let mut services_ready = false;
-            for _ in 0..20 {
-                if let Ok(services) = ble.list_characteristics(id.clone()).await {
-                    if services.iter().any(|s| s.uuid == SERVICE_UUID) {
-                        services_ready = true;
-                        break;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-
-            if !services_ready {
-                is_loaded.set(true);
-                return;
-            }
-
-            // 读取刷新频率特性 (0xFFE9)
-            match ble.read(&id, SERVICE_UUID, PS_FREQ_UUID).await {
-                Ok(data) => {
-                    if let Some(frequency) = parse_ps_frequency(&data) {
-                        // Zero intentionally disables periodic reads and must
-                        // not fall back to the default.
-                        ps_refresh_freq.set(frequency);
-                    } else {
-                        error!(
-                            "PS frequency characteristic returned an invalid value: {data:02X?}"
-                        );
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to read freq: {}", e);
-                }
-            }
-
-            // 读取电池电量 (0x2A19)
             match ble
                 .read(&id, BATTERY_SERVICE_UUID, BATTERY_LEVEL_UUID)
                 .await
@@ -151,35 +58,7 @@ pub fn Status() -> Element {
                         battery_level.set(level as i32);
                     }
                 }
-                Err(e) => {
-                    error!("Failed to read battery: {}", e);
-                }
-            }
-
-            is_loaded.set(true);
-        }
-    });
-
-    // Battery Subscription
-    use_resource(move || {
-        let id = app_state.connected_device_id.read().clone();
-        async move {
-            if id.is_empty() {
-                return;
-            }
-            // Wait for services to be discovered
-            let mut battery_service_ready = false;
-            for _ in 0..20 {
-                if let Ok(services) = ble.list_characteristics(id.clone()).await {
-                    if services.iter().any(|s| s.uuid == BATTERY_SERVICE_UUID) {
-                        battery_service_ready = true;
-                        break;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            if !battery_service_ready {
-                return;
+                Err(e) => error!("Failed to read battery: {e}"),
             }
             match ble
                 .subscribe(&id, BATTERY_SERVICE_UUID, BATTERY_LEVEL_UUID)
@@ -187,242 +66,132 @@ pub fn Status() -> Element {
             {
                 Ok(mut stream) => {
                     while let Some(data) = stream.next().await {
-                        if cancelled() {
-                            break;
-                        }
                         if let Some(level) = parse_battery_level(&data.value) {
                             battery_level.set(level as i32);
                         }
                     }
                 }
-                Err(e) => error!("Failed to subscribe battery: {}", e),
+                Err(e) => error!("Failed to subscribe to battery: {e}"),
             }
         }
     });
 
-    // PS Polling
-    use_resource(move || {
-        let id = app_state.connected_device_id.read().clone();
-        async move {
-            if id.is_empty() {
-                return;
-            }
+    let id = device_id.clone();
+    let write_frequency =
+        use_coroutine(move |mut rx: UnboundedReceiver<(Option<i32>, Instant)>| {
+            let id = id.clone();
+            async move {
+                let result = ble
+                    .read(&id, SERVICE_UUID, PS_FREQ_UUID)
+                    .await
+                    .and_then(|data| {
+                        parse_ps_frequency(&data).ok_or_else(|| {
+                            format!("0xFFE9 应返回 1 字节，实际返回 {} 字节", data.len())
+                        })
+                    });
+                match result {
+                    Ok(frequency) => ps_frequency.set(Some(frequency)),
+                    Err(error) => frequency_error.set(Some(error)),
+                }
 
-            let mut first_sample = true;
-            let mut invalid_sample_logged = false;
+                while let Some(value) = next_frequency_write(&mut rx).await {
+                    if *ps_frequency.peek() == Some(value) {
+                        frequency_error.set(None);
+                        continue;
+                    }
+                    match ble
+                        .write(&id, SERVICE_UUID, PS_FREQ_UUID, vec![value as u8])
+                        .await
+                    {
+                        Ok(()) => {
+                            ps_frequency.set(Some(value));
+                            frequency_error.set(None);
+                        }
+                        Err(error) => frequency_error.set(Some(error)),
+                    }
+                }
+            }
+        });
+
+    let id = device_id.clone();
+    use_future(move || {
+        let id = id.clone();
+        async move {
+            let mut first_read = true;
             loop {
-                if cancelled() {
-                    break;
+                let poll_hz = ps_frequency().unwrap_or(DEFAULT_POLL_HZ);
+                // Zero disables periodic reads. Still show one snapshot when opening the page.
+                if poll_hz == 0 && !first_read {
+                    tokio::time::sleep(READ_RETRY_DELAY).await;
+                    continue;
                 }
-                let freq = ps_refresh_freq();
-                if freq > 0 {
-                    // FFE7 is defined by the device protocol as a two-byte read
-                    // characteristic. Do not select notification mode based on
-                    // incomplete or inconsistent metadata from Windows BLE.
-                    match ble.read(&id, SERVICE_UUID, PS_DATA_UUID).await {
-                        Ok(data) => {
-                            update_ps_data(
-                                &data,
-                                &mut sensor_data_1,
-                                &mut first_sample,
-                                &mut invalid_sample_logged,
-                                "read",
-                            );
+                first_read = false;
+                let result = ble
+                    .read(&id, SERVICE_UUID, PS_DATA_UUID)
+                    .await
+                    .and_then(|data| {
+                        parse_ps_value(&data).ok_or_else(|| {
+                            format!("0xFFE7 应返回 2 字节，实际返回 {} 字节", data.len())
+                        })
+                    });
+                let delay = match result {
+                    Ok(value) => {
+                        if ps_samples.peek().is_empty() {
+                            info!("Received first PS reading: {value}");
                         }
-                        Err(e) => {
-                            // The Windows BLE service cache can lag behind the
-                            // completed connection. BleManager::read refreshes
-                            // that cache on failure, so retry instead of leaving
-                            // the view in a permanent waiting state.
-                            error!("Failed to read PS data: {}", e);
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            continue;
-                        }
-                    }
-                    let delay = 1000 / freq as u64;
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                } else {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            }
-        }
-    });
-
-    // PS Interrupt Subscription
-    use_resource(move || {
-        let id = app_state.connected_device_id.read().clone();
-        async move {
-            if id.is_empty() {
-                return;
-            }
-            // Wait for services to be discovered
-            for _ in 0..20 {
-                if let Ok(services) = ble.list_characteristics(id.clone()).await {
-                    if services.iter().any(|s| s.uuid == SERVICE_UUID) {
-                        break;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            match ble.subscribe(&id, SERVICE_UUID, PS_INT_UUID).await {
-                Ok(mut stream) => {
-                    while let Some(_data) = stream.next().await {
-                        if cancelled() {
-                            break;
-                        }
-                        match parse_interrupt_notification(&_data.value) {
-                            Some(true) => {}
-                            Some(false) => continue,
-                            None => {
-                                error!(
-                                    "PS interrupt characteristic returned an invalid notification"
-                                );
-                                continue;
+                        ps_samples.with_mut(|readings| {
+                            if readings.len() >= 50 {
+                                readings.remove(0);
                             }
-                        }
-                        trigger_count_1.with_mut(|c| *c += 1);
-                        trigger_active_1.set(true);
-                        let mut active = trigger_active_1;
-                        spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                            active.set(false);
+                            readings.push(value);
                         });
+                        if ps_error.peek().is_some() {
+                            ps_error.set(None);
+                        }
+                        Duration::from_millis(1000 / poll_hz.max(1) as u64)
                     }
-                }
-                Err(e) => error!("Failed to subscribe PS int: {}", e),
+                    Err(error) => {
+                        if ps_error.peek().as_deref() != Some(error.as_str()) {
+                            error!("Failed to read PS value: {error}");
+                            ps_error.set(Some(error));
+                        }
+                        READ_RETRY_DELAY
+                    }
+                };
+                tokio::time::sleep(delay).await;
             }
         }
     });
 
-    // Reload Interrupt Subscription
-    use_resource(move || {
-        let id = app_state.connected_device_id.read().clone();
-        async move {
-            if id.is_empty() {
-                return;
-            }
-            // Wait for services to be discovered
-            let mut services_ready = false;
-            for _ in 0..20 {
-                if let Ok(services) = ble.list_characteristics(id.clone()).await {
-                    if services.iter().any(|s| s.uuid == SERVICE_UUID) {
-                        services_ready = true;
-                        break;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            if !services_ready {
-                return;
-            }
-            match ble.subscribe(&id, SERVICE_UUID, RELOAD_INT_UUID).await {
-                Ok(mut stream) => {
-                    while let Some(_data) = stream.next().await {
-                        if cancelled() {
-                            break;
-                        }
-                        match parse_interrupt_notification(&_data.value) {
-                            Some(true) => {}
-                            Some(false) => continue,
-                            None => {
-                                error!(
-                                    "Reload interrupt characteristic returned an invalid notification"
-                                );
-                                continue;
-                            }
-                        }
-                        trigger_count_2.with_mut(|c| *c += 1);
-                        trigger_active_2.set(true);
-                        let mut active = trigger_active_2;
-                        spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                            active.set(false);
-                        });
-                    }
-                }
-                Err(e) => error!("Failed to subscribe Reload int: {}", e),
-            }
-        }
-    });
+    let readings = ps_samples();
+    let frequency = ps_frequency();
+    let last_reading = readings.last().copied();
+    let frequency_error = frequency_error();
+    let frequency_loading = frequency.is_none() && frequency_error.is_none();
+    let freq_value = frequency_input()
+        .or_else(|| frequency.map(|value| value.to_string()))
+        .unwrap_or_default();
 
-    let theme = (app_state.theme)();
     rsx! {
-        div {
-            class: theme
-                .pick(
-                    "h-full w-full text-gray-100 overflow-auto relative",
-                    "h-full w-full text-gray-900 overflow-auto relative",
-                ),
-            if device_id.is_empty() {
-                StatusEmptyState {}
-            } else {
-                if !is_loaded() {
-                    div {
-                        class: theme
-                            .pick(
-                                "absolute inset-0 z-50 flex items-center justify-center bg-[#1b1b1b]/80 backdrop-blur-sm",
-                                "absolute inset-0 z-50 flex items-center justify-center bg-white/80 backdrop-blur-sm",
-                            ),
-                        div { class: "flex flex-col items-center gap-3",
-                            span { class: "animate-spin inline-block w-8 h-8 border-4 border-[#60cd18] border-t-transparent rounded-full" }
-                            span { class: theme.pick("text-sm text-gray-300 font-medium", "text-sm text-gray-600 font-medium"),
-                                "正在发现服务..."
-                            }
-                        }
-                    }
-                }
-                StatusContent {
-                    battery_level: battery_level(),
-                    sensor_data_1: sensor_data_1(),
-                    trigger_count_1: trigger_count_1(),
-                    trigger_count_2: trigger_count_2(),
-                    trigger_active_1: trigger_active_1(),
-                    trigger_active_2: trigger_active_2(),
-                    ps_freq: ps_refresh_freq(),
-                    on_ps_freq_change,
-                    on_reset_ps: move |_| trigger_count_1.set(0),
-                    on_reset_reload: move |_| trigger_count_2.set(0),
-                }
+        div { class: "w-full max-w-5xl mx-auto space-y-5",
+            StatusHeader { battery_level: battery_level() }
+            SensorCard {
+                current_value: last_reading,
+                data: readings,
+                read_error: ps_error(),
+                paused: frequency == Some(0),
+                freq_value,
+                frequency_error,
+                frequency_loading,
+                on_freq_input: move |input: String| {
+                    let value = parse_frequency_input(&input);
+                    frequency_input.set(Some(input));
+                    write_frequency.send((value, Instant::now() + FREQUENCY_WRITE_DELAY));
+                },
             }
+            TriggerCounters { device_id }
         }
     }
-}
-
-fn update_ps_data(
-    data: &[u8],
-    sensor_data: &mut Signal<Vec<u16>>,
-    first_sample: &mut bool,
-    invalid_sample_logged: &mut bool,
-    source: &str,
-) {
-    let Some(value) = parse_ps_value(data) else {
-        if !*invalid_sample_logged {
-            error!(
-                "PS {source} returned an invalid value length: {} bytes",
-                data.len()
-            );
-            *invalid_sample_logged = true;
-        }
-        return;
-    };
-    if *first_sample {
-        info!("Received first PS {source} sample: {data:02X?} = {value} (little-endian)");
-        *first_sample = false;
-    }
-    sensor_data.with_mut(|readings| {
-        if readings.len() >= 50 {
-            readings.remove(0);
-        }
-        readings.push(value);
-    });
-}
-
-fn ps_chart_max(data: &[u16]) -> u16 {
-    data.iter()
-        .copied()
-        .max()
-        .unwrap_or(0)
-        .max(PS_CHART_BASE_MAX)
 }
 
 fn parse_ps_value(data: &[u8]) -> Option<u16> {
@@ -437,6 +206,28 @@ fn parse_ps_frequency(data: &[u8]) -> Option<i32> {
         [frequency] => Some((frequency & 0x0f).min(PS_FREQ_MAX as u8) as i32),
         _ => None,
     }
+}
+
+fn parse_frequency_input(input: &str) -> Option<i32> {
+    input
+        .parse()
+        .ok()
+        .filter(|value| (0..=PS_FREQ_MAX).contains(value))
+}
+
+async fn next_frequency_write(
+    edits: &mut UnboundedReceiver<(Option<i32>, Instant)>,
+) -> Option<i32> {
+    while let Some((mut value, mut deadline)) = edits.next().await {
+        // Clearing the field or entering an invalid value also cancels the pending write.
+        while let Ok(next) = timeout_at(deadline, edits.next()).await {
+            (value, deadline) = next?;
+        }
+        if value.is_some() {
+            return value;
+        }
+    }
+    None
 }
 
 fn parse_battery_level(data: &[u8]) -> Option<u8> {
@@ -468,49 +259,12 @@ fn StatusEmptyState() -> Element {
 }
 
 #[component]
-fn StatusContent(
-    battery_level: i32,
-    sensor_data_1: Vec<u16>,
-    trigger_count_1: i32,
-    trigger_count_2: i32,
-    trigger_active_1: bool,
-    trigger_active_2: bool,
-    ps_freq: i32,
-    on_ps_freq_change: EventHandler<i32>,
-    on_reset_ps: EventHandler<()>,
-    on_reset_reload: EventHandler<()>,
-) -> Element {
-    rsx! {
-        div { class: "w-full max-w-5xl mx-auto space-y-5",
-            StatusHeader { battery_level }
-            SensorCharts {
-                ps_data: sensor_data_1,
-                ps_freq,
-                on_ps_freq_change,
-            }
-            TriggerCounters {
-                ps_int_count: trigger_count_1,
-                reload_int_count: trigger_count_2,
-                ps_int_active: trigger_active_1,
-                reload_int_active: trigger_active_2,
-                on_reset_ps,
-                on_reset_reload,
-            }
-        }
-    }
-}
-
-#[component]
 fn StatusHeader(battery_level: i32) -> Element {
     let (battery_color, battery_bg) = get_battery_style(battery_level);
 
     rsx! {
         div { class: "page-header flex items-end justify-between gap-4",
-            div {
-                p { class: "eyebrow", "LIVE TELEMETRY" }
-                h1 { class: "mt-1 text-2xl font-semibold tracking-tight", "设备状态" }
-                p { class: "mt-1 text-sm text-slate-400", "实时查看接近传感器数据与设备通知" }
-            }
+            h1 { class: "text-2xl font-semibold tracking-tight", "设备状态" }
             BatteryIndicator { level: battery_level, color: battery_color, bg: battery_bg }
         }
     }
@@ -543,136 +297,119 @@ fn BatteryIndicator(level: i32, color: &'static str, bg: &'static str) -> Elemen
 }
 
 #[component]
-fn SensorCharts(ps_data: Vec<u16>, ps_freq: i32, on_ps_freq_change: EventHandler<i32>) -> Element {
-    let chart_max = ps_chart_max(&ps_data);
-    rsx! {
-        div { class: "grid grid-cols-1 gap-4",
-            SensorCard {
-                title: "PS 传感器数据".to_string(),
-                subtitle: "接近传感器实时数据 (UUID: 0xFFE7)".to_string(),
-                current_value: ps_data.last().copied(),
-                data: ps_data,
-                color: "#60cd18".to_string(),
-                freq: ps_freq,
-                max_value: chart_max,
-                on_freq_change: on_ps_freq_change,
-            }
-        }
-    }
-}
-
-#[component]
 fn SensorCard(
-    title: String,
-    subtitle: String,
     current_value: Option<u16>,
     data: Vec<u16>,
-    color: String,
-    freq: i32,
-    max_value: u16,
-    on_freq_change: EventHandler<i32>,
+    read_error: Option<String>,
+    paused: bool,
+    freq_value: String,
+    frequency_error: Option<String>,
+    frequency_loading: bool,
+    on_freq_input: EventHandler<String>,
 ) -> Element {
-    let value_color = if color == "#60cd18" {
-        "text-[#60cd18]"
-    } else {
-        "text-[#2d6cdf]"
-    };
-    let app_state = use_app_state();
-    let theme = (app_state.theme)();
+    let theme = (use_app_state().theme)();
+    let frequency_invalid = !freq_value.is_empty() && parse_frequency_input(&freq_value).is_none();
 
     rsx! {
         div {
-            class: theme
-                .pick(
-                    "panel rounded-2xl border border-white/10 bg-white/[0.04] p-5 space-y-3 shadow-xl shadow-black/10",
-                    "panel rounded-2xl border border-slate-200 bg-white p-5 space-y-3 shadow-sm",
-                ),
+            class: theme.pick(
+                "panel rounded-2xl border border-white/10 bg-white/[0.04] p-5 space-y-3 shadow-xl shadow-black/10",
+                "panel rounded-2xl border border-slate-200 bg-white p-5 space-y-3 shadow-sm",
+            ),
             div {
                 div { class: "flex items-center justify-between mb-1",
-                    h2 { class: "text-base font-medium", "{title}" }
-                    div {
-                        class: theme
-                            .pick(
-                                "flex items-center gap-2 text-xs text-slate-400",
-                                "flex items-center gap-2 text-xs text-slate-500",
-                            ),
-                        span { "刷新" }
+                    h2 { class: "text-base font-medium", "PS 传感器数据" }
+                    div { class: theme.pick(
+                        "flex items-center gap-2 text-xs text-slate-400",
+                        "flex items-center gap-2 text-xs text-slate-500",
+                    ),
+                        label { r#for: "ps-frequency", "刷新" }
                         input {
+                            id: "ps-frequency",
                             class: theme.pick("sensor-frequency-input sensor-frequency-input-dark", "sensor-frequency-input sensor-frequency-input-light"),
                             r#type: "number",
                             min: "0",
-                            max: "15",
-                            value: "{freq}",
+                            max: "{PS_FREQ_MAX}",
+                            value: "{freq_value}",
+                            disabled: frequency_loading,
+                            aria_invalid: frequency_invalid,
                             step: "1",
                             inputmode: "numeric",
-                            onchange: move |e| {
-                                if let Ok(value) = e.value().parse::<i32>() {
-                                    on_freq_change.call(value.clamp(0, PS_FREQ_MAX));
-                                }
-                            },
+                            oninput: move |e| on_freq_input.call(e.value()),
                         }
                         span { "次/秒" }
                         span { class: "text-[10px] text-slate-500", "0=停止" }
                     }
                 }
-                p { class: "text-[10px] text-gray-500", "{subtitle}" }
-            }
-            div { class: theme.pick("sensor-reading sensor-reading-dark", "sensor-reading sensor-reading-light"),
-                span { class: "sensor-reading-label", "当前值" }
-                div { class: "sensor-reading-value-group",
-                    if let Some(value) = current_value {
-                        div { class: "sensor-reading-value tabular-nums {value_color}", "{value}" }
-                    } else {
-                        div { class: "sensor-reading-empty", "等待读取数据" }
+                p { class: "text-[10px] text-gray-500", "接近传感器实时数据 (UUID: 0xFFE7)" }
+                if frequency_invalid {
+                    p { class: theme.pick("text-xs text-red-300", "text-xs text-red-700"),
+                        "请输入 0–{PS_FREQ_MAX} 的整数"
                     }
-                    div { class: "sensor-reading-scale", "图表范围 0–{max_value}" }
+                }
+                if let Some(error) = &frequency_error {
+                    p {
+                        class: theme.pick("text-xs text-red-300", "text-xs text-red-700"),
+                        style: "overflow-wrap: anywhere",
+                        "刷新频率操作失败 · {error}"
+                    }
                 }
             }
-            ChartView { data, color, max_value }
+            div { class: theme.pick("sensor-reading sensor-reading-dark", "sensor-reading sensor-reading-light"),
+                span { class: "sensor-reading-label",
+                    if current_value.is_some() && (paused || read_error.is_some()) {
+                        "最后读数"
+                    } else {
+                        "当前值"
+                    }
+                }
+                div { class: "sensor-reading-value-group",
+                    if let Some(value) = current_value {
+                        div { class: "sensor-reading-value tabular-nums text-[#60cd18]", "{value}" }
+                    } else if read_error.is_some() {
+                        div { class: "sensor-reading-empty", "读取失败" }
+                    } else {
+                        div { class: "sensor-reading-empty", "正在读取…" }
+                    }
+                    if paused {
+                        div { class: "sensor-reading-scale", "周期读取已暂停" }
+                    }
+                }
+            }
+            if let Some(error) = read_error {
+                p {
+                    class: theme.pick("text-xs text-red-300", "text-xs text-red-700"),
+                    style: "overflow-wrap: anywhere",
+                    "PS 读取失败 · {error}"
+                }
+            }
+            ChartView { data }
         }
     }
 }
 
 #[component]
-fn TriggerCounters(
-    ps_int_count: i32,
-    reload_int_count: i32,
-    ps_int_active: bool,
-    reload_int_active: bool,
-    on_reset_ps: EventHandler<()>,
-    on_reset_reload: EventHandler<()>,
-) -> Element {
-    let app_state = use_app_state();
-    let theme = (app_state.theme)();
+fn TriggerCounters(device_id: String) -> Element {
+    let theme = (use_app_state().theme)();
     rsx! {
         div {
-            class: theme
-                .pick(
-                    "panel rounded-2xl border border-white/10 bg-white/[0.04] p-5",
-                    "panel rounded-2xl border border-slate-200 bg-white p-5 shadow-sm",
-                ),
-            div { class: "mb-3",
-                h2 { class: "text-base font-medium", "中断通知计数器" }
-                p { class: theme.pick("text-[10px] text-gray-500 mt-0.5", "text-[10px] text-gray-400 mt-0.5"),
-                    "接收来自设备的中断通知"
-                }
-            }
+            class: theme.pick(
+                "panel rounded-2xl border border-white/10 bg-white/[0.04] p-5",
+                "panel rounded-2xl border border-slate-200 bg-white p-5 shadow-sm",
+            ),
+            h2 { class: "mb-3 text-base font-medium", "中断通知计数器" }
             div { class: "grid grid-cols-1 md:grid-cols-2 gap-4",
                 TriggerCounter {
-                    label: "PS 中断通知".to_string(),
-                    subtitle: "UUID: 0xFFE4".to_string(),
-                    count: ps_int_count,
-                    is_active: ps_int_active,
+                    device_id: device_id.clone(),
+                    uuid: PS_INT_UUID,
+                    label: "PS 中断通知",
                     color: "emerald",
-                    on_reset: on_reset_ps,
                 }
                 TriggerCounter {
-                    label: "Reload 中断通知".to_string(),
-                    subtitle: "UUID: 0xFFE6".to_string(),
-                    count: reload_int_count,
-                    is_active: reload_int_active,
+                    device_id,
+                    uuid: RELOAD_INT_UUID,
+                    label: "Reload 中断通知",
                     color: "orange",
-                    on_reset: on_reset_reload,
                 }
             }
         }
@@ -681,16 +418,76 @@ fn TriggerCounters(
 
 #[component]
 fn TriggerCounter(
-    label: String,
-    subtitle: String,
-    count: i32,
-    is_active: bool,
+    device_id: String,
+    uuid: &'static str,
+    label: &'static str,
     color: &'static str,
-    on_reset: EventHandler<()>,
 ) -> Element {
+    let ble = use_ble();
+    let mut count = use_signal(|| None::<u32>);
+    let mut active = use_signal(|| false);
+    let mut notification_status = use_signal(|| None::<Result<(), String>>);
+    use_future(move || {
+        let id = device_id.clone();
+        async move {
+            let mut flash: Option<Task> = None;
+            loop {
+                let error = match ble.subscribe(&id, SERVICE_UUID, uuid).await {
+                    Ok(mut stream) => {
+                        notification_status.set(Some(Ok(())));
+                        if count.peek().is_none() {
+                            count.set(Some(0));
+                        }
+                        while let Some(data) = stream.next().await {
+                            let Some(triggered) = parse_interrupt_notification(&data.value) else {
+                                notification_status.set(Some(Err(format!(
+                                    "通知应包含 1 字节，实际收到 {} 字节",
+                                    data.value.len()
+                                ))));
+                                continue;
+                            };
+                            if matches!(&*notification_status.peek(), Some(Err(_))) {
+                                notification_status.set(Some(Ok(())));
+                            }
+                            if triggered {
+                                count.with_mut(|value| {
+                                    *value = Some(value.unwrap_or_default().saturating_add(1));
+                                });
+                                if let Some(task) = flash.take() {
+                                    task.cancel();
+                                }
+                                active.set(true);
+                                flash = Some(spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(150)).await;
+                                    active.set(false);
+                                }));
+                            }
+                        }
+                        "通知流已关闭".to_string()
+                    }
+                    Err(error) => error,
+                };
+                if !matches!(&*notification_status.peek(), Some(Err(previous)) if previous == &error)
+                {
+                    error!("Failed to receive notifications for {uuid}: {error}");
+                    notification_status.set(Some(Err(error)));
+                }
+                tokio::time::sleep(SUBSCRIBE_RETRY_DELAY).await;
+            }
+        }
+    });
+
     let (text_color, border_color, bg_color, ripple_color) = get_trigger_colors(color);
     let app_state = use_app_state();
     let theme = (app_state.theme)();
+    let is_active = active();
+    let count_label = count().map_or_else(|| "—".to_string(), |value| value.to_string());
+    let notice = notification_status();
+    let subtitle = match &notice {
+        Some(Ok(())) => "正在监听",
+        Some(Err(_)) => "通知接收失败",
+        None => "正在订阅…",
+    };
     let inactive_card = theme.pick(
         "rounded-xl border border-white/10 bg-[#101d2b] p-4 space-y-1 transition-all duration-150",
         "rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-1 transition-all duration-150",
@@ -748,7 +545,7 @@ fn TriggerCounter(
                             text_color,
                         ),
                         style: if is_active { "text-shadow: 0 0 12px rgba(255,255,255,0.35);" } else { "" },
-                        "{count}"
+                        "{count_label}"
                     }
                 }
 
@@ -760,9 +557,17 @@ fn TriggerCounter(
                                 "text-[10px] px-2 py-0.5 rounded bg-[#2a2a2a] hover:bg-[#333] cursor-pointer text-gray-300 transition-colors",
                                 "text-[10px] px-2 py-0.5 rounded bg-gray-100 hover:bg-gray-200 cursor-pointer text-gray-600 transition-colors",
                             ),
-                        onclick: move |_| on_reset.call(()),
+                        disabled: count().is_none(),
+                        onclick: move |_| count.set(Some(0)),
                         "重置"
                     }
+                }
+            }
+            if let Some(Err(error)) = notice {
+                p {
+                    class: theme.pick("mt-2 text-xs text-red-300", "mt-2 text-xs text-red-700"),
+                    style: "overflow-wrap: anywhere",
+                    "{error}"
                 }
             }
         }
@@ -805,112 +610,123 @@ fn get_trigger_colors(color: &str) -> (&'static str, &'static str, &'static str,
 }
 
 #[component]
-fn ChartView(data: Vec<u16>, color: String, max_value: u16) -> Element {
-    let path_data = generate_chart_path(&data, max_value);
-    let app_state = use_app_state();
-    let theme = (app_state.theme)();
+fn ChartView(data: Vec<u16>) -> Element {
+    let scale = ChartScale::from_samples(&data);
+    let (line_path, fill_path) = generate_chart_paths(&data, scale);
+    let theme = (use_app_state().theme)();
+    let line_color = theme.pick("#60cd18", "#3b8314");
+    let grid_color = theme.pick("#33475a", "#d3dee7");
 
     rsx! {
         div {
-            class: theme
-                .pick(
-                "w-full h-40 bg-[#0b1521] rounded-xl p-3 border border-white/10",
-                "w-full h-40 bg-slate-50 rounded-xl p-3 border border-slate-200",
-                ),
-            svg {
-                class: "w-full h-full",
-                view_box: "0 0 100 150",
-                preserve_aspect_ratio: "none",
-                ChartGrid {}
-                ChartLine { path: path_data.line_path, color: color.clone() }
-                ChartFill { path: path_data.fill_path, color }
+            class: theme.pick(
+                "ps-chart h-40 bg-[#0b1521] rounded-xl p-3 border border-white/10 text-slate-400",
+                "ps-chart h-40 bg-slate-50 rounded-xl p-3 border border-slate-200 text-slate-600",
+            ),
+            div { class: "ps-chart-axis",
+                for tick in scale.ticks() {
+                    span { key: "{tick}", "{tick}" }
+                }
+            }
+            div { class: "ps-chart-plot",
+                svg {
+                    view_box: "0 0 {CHART_WIDTH} {CHART_HEIGHT}",
+                    preserve_aspect_ratio: "none",
+                    role: "img",
+                    "aria-label": "最近的 PS 读数曲线",
+                    for tick in scale.ticks() {
+                        line {
+                            key: "{tick}",
+                            x1: "0",
+                            y1: "{scale.y(tick)}",
+                            x2: "{CHART_WIDTH}",
+                            y2: "{scale.y(tick)}",
+                            stroke: "{grid_color}",
+                            stroke_width: "1",
+                            vector_effect: "non-scaling-stroke",
+                        }
+                    }
+                    path { d: "{fill_path}", fill: "{line_color}", fill_opacity: "0.12" }
+                    path {
+                        d: "{line_path}",
+                        fill: "none",
+                        stroke: "{line_color}",
+                        stroke_width: "2",
+                        stroke_linejoin: "round",
+                        stroke_linecap: "round",
+                        vector_effect: "non-scaling-stroke",
+                    }
+                }
             }
         }
     }
 }
 
-#[component]
-fn ChartGrid() -> Element {
-    rsx! {
-        for i in 0..5 {
-            line {
-                x1: "0",
-                y1: "{i as f64 * 150.0 / 4.0}",
-                x2: "100",
-                y2: "{i as f64 * 150.0 / 4.0}",
-                stroke: "#33475a",
-                stroke_width: "0.5",
-            }
-        }
-    }
+const CHART_WIDTH: f64 = 100.0;
+const CHART_HEIGHT: f64 = 150.0;
+
+#[derive(Clone, Copy)]
+struct ChartScale {
+    min: u32,
+    max: u32,
+    step: u32,
 }
 
-#[component]
-fn ChartLine(path: String, color: String) -> Element {
-    rsx! {
-        path {
-            d: "{path}",
-            fill: "none",
-            stroke: "{color}",
-            stroke_width: "2",
-            stroke_linejoin: "round",
-            stroke_linecap: "round",
-        }
-    }
-}
-
-#[component]
-fn ChartFill(path: String, color: String) -> Element {
-    rsx! {
-        path { d: "{path}", fill: "{color}", fill_opacity: "0.1" }
-    }
-}
-
-struct ChartPath {
-    line_path: String,
-    fill_path: String,
-}
-
-fn generate_chart_path(data: &[u16], max_value: u16) -> ChartPath {
-    let chart_height = 150.0;
-    let chart_width = 100.0;
-    let data_points = data.len();
-
-    if data_points == 0 || max_value == 0 {
-        return ChartPath {
-            line_path: format!("M 0 {chart_height}"),
-            fill_path: format!("M 0 {chart_height} L {chart_width} {chart_height} Z"),
+impl ChartScale {
+    fn from_samples(samples: &[u16]) -> Self {
+        let min = u32::from(samples.iter().copied().min().unwrap_or_default());
+        let max = u32::from(samples.iter().copied().max().unwrap_or_default());
+        // Leave a margin around the samples, even when every reading is equal.
+        let padding = (max - min).div_ceil(10).max(2);
+        let lower = min.saturating_sub(padding);
+        let upper = (max + padding).max(lower + 4);
+        let approximate_step = (upper - lower).div_ceil(4);
+        let magnitude = 10_u32.pow(approximate_step.ilog10());
+        let step = match approximate_step.div_ceil(magnitude) {
+            1 => magnitude,
+            2 => 2 * magnitude,
+            3..=5 => 5 * magnitude,
+            _ => 10 * magnitude,
         };
-    }
-
-    let mut path_parts: Vec<String> = Vec::new();
-
-    for (i, value) in data.iter().enumerate() {
-        let x = if data_points == 1 {
-            chart_width / 2.0
-        } else {
-            (i as f64 / (data_points - 1) as f64) * chart_width
-        };
-        let normalized = (*value as f64 / max_value as f64).clamp(0.0, 1.0);
-        let y = chart_height - (normalized * chart_height);
-
-        if i == 0 {
-            path_parts.push(format!("M {:.2} {:.2}", x, y));
-        } else {
-            path_parts.push(format!("L {:.2} {:.2}", x, y));
+        Self {
+            min: lower / step * step,
+            max: upper.next_multiple_of(step),
+            step,
         }
     }
 
-    let line_path = path_parts.join(" ");
-    let fill_path = format!(
-        "{} L {:.2} {:.2} L 0 {:.2} Z",
-        line_path, chart_width, chart_height, chart_height
-    );
-
-    ChartPath {
-        line_path,
-        fill_path,
+    fn ticks(self) -> impl Iterator<Item = u32> {
+        (self.min..=self.max).rev().step_by(self.step as usize)
     }
+
+    fn y(self, value: u32) -> f64 {
+        CHART_HEIGHT * f64::from(self.max - value) / f64::from(self.max - self.min)
+    }
+}
+
+fn generate_chart_paths(data: &[u16], scale: ChartScale) -> (String, String) {
+    use std::fmt::Write as _;
+
+    let first = match data {
+        [] => return (String::new(), String::new()),
+        [value] => {
+            let x = CHART_WIDTH / 2.0;
+            let y = scale.y(u32::from(*value));
+            // A round, zero-length stroke marks the first sample until a line can be drawn.
+            return (format!("M {x:.2} {y:.2} L {x:.2} {y:.2}"), String::new());
+        }
+        [first, ..] => *first,
+    };
+
+    let mut line_path = format!("M 0 {:.2}", scale.y(u32::from(first)));
+    for (i, value) in data.iter().enumerate().skip(1) {
+        let x = CHART_WIDTH * i as f64 / (data.len() - 1) as f64;
+        let y = scale.y(u32::from(*value));
+        let _ = write!(line_path, " L {x:.2} {y:.2}");
+    }
+
+    let fill_path = format!("{line_path} L {CHART_WIDTH} {CHART_HEIGHT} L 0 {CHART_HEIGHT} Z");
+    (line_path, fill_path)
 }
 
 fn get_battery_style(level: i32) -> (&'static str, &'static str) {
@@ -926,9 +742,11 @@ fn get_battery_style(level: i32) -> (&'static str, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_battery_level, parse_interrupt_notification, parse_ps_frequency, parse_ps_value,
-        ps_chart_max,
+        generate_chart_paths, next_frequency_write, parse_battery_level, parse_frequency_input,
+        parse_interrupt_notification, parse_ps_frequency, parse_ps_value, ChartScale, CHART_HEIGHT,
+        FREQUENCY_WRITE_DELAY,
     };
+    use tokio::time::Instant;
 
     #[test]
     fn ps_reading_requires_exactly_two_little_endian_bytes() {
@@ -939,10 +757,34 @@ mod tests {
     }
 
     #[test]
-    fn chart_scale_expands_when_a_reading_exceeds_twelve_bits() {
-        assert_eq!(ps_chart_max(&[0, 100, 4095]), 4095);
-        assert_eq!(ps_chart_max(&[0, 0x1234]), 0x1234);
-        assert_eq!(ps_chart_max(&[]), 4095);
+    fn chart_scale_fits_recent_samples_and_uses_the_same_range_for_ticks_and_points() {
+        let low = ChartScale::from_samples(&[0, 1, 3, 1]);
+        assert_eq!(low.ticks().collect::<Vec<_>>(), [6, 4, 2, 0]);
+        assert_eq!(low.y(3), CHART_HEIGHT / 2.0);
+        assert_eq!(low.y(0), CHART_HEIGHT);
+
+        let high = ChartScale::from_samples(&[0x1234, 0x1235]);
+        assert!(high.min > 0x1200);
+        assert!(high.y(0x1234) - high.y(0x1235) >= CHART_HEIGHT / 6.0);
+        assert_eq!(high.ticks().last(), Some(high.min));
+
+        let full = ChartScale::from_samples(&[0, u16::MAX]);
+        assert!(full.y(u32::from(u16::MAX)) < CHART_HEIGHT / 2.0);
+        assert_eq!(full.min, 0);
+    }
+
+    #[test]
+    fn chart_handles_empty_and_constant_samples() {
+        let scale = ChartScale::from_samples(&[]);
+        assert!(scale.max > scale.min);
+        assert!(generate_chart_paths(&[], scale).0.is_empty());
+        let zero = ChartScale::from_samples(&[0]);
+        let (line, fill) = generate_chart_paths(&[0], zero);
+        assert_eq!(line, "M 50.00 150.00 L 50.00 150.00");
+        assert!(fill.is_empty());
+
+        let flat = ChartScale::from_samples(&[u16::MAX, u16::MAX]);
+        assert_eq!(flat.y(u32::from(u16::MAX)), CHART_HEIGHT / 2.0);
     }
 
     #[test]
@@ -952,6 +794,41 @@ mod tests {
         assert_eq!(parse_ps_frequency(&[0xf5]), Some(5));
         assert_eq!(parse_ps_frequency(&[]), None);
         assert_eq!(parse_ps_frequency(&[1, 2]), None);
+    }
+
+    #[tokio::test]
+    async fn frequency_edits_apply_only_the_latest_valid_value_after_a_pause() {
+        let (tx, mut edits) = futures::channel::mpsc::unbounded();
+        tx.unbounded_send((
+            parse_frequency_input("1"),
+            Instant::now() + FREQUENCY_WRITE_DELAY,
+        ))
+        .unwrap();
+        let write = next_frequency_write(&mut edits);
+        tokio::pin!(write);
+        assert!(futures::poll!(&mut write).is_pending());
+
+        tx.unbounded_send((parse_frequency_input("15"), Instant::now()))
+            .unwrap();
+        assert_eq!(write.await, Some(15));
+    }
+
+    #[tokio::test]
+    async fn clearing_or_exceeding_the_frequency_range_cancels_a_pending_write() {
+        let (tx, mut edits) = futures::channel::mpsc::unbounded();
+        tx.unbounded_send((parse_frequency_input("1"), Instant::now()))
+            .unwrap();
+        tx.unbounded_send((parse_frequency_input("16"), Instant::now()))
+            .unwrap();
+        tx.unbounded_send((parse_frequency_input(""), Instant::now()))
+            .unwrap();
+
+        let write = next_frequency_write(&mut edits);
+        tokio::pin!(write);
+        assert!(futures::poll!(&mut write).is_pending());
+        tx.unbounded_send((parse_frequency_input("0"), Instant::now()))
+            .unwrap();
+        assert_eq!(write.await, Some(0));
     }
 
     #[test]

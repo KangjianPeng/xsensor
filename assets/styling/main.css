@@ -29,16 +29,15 @@ input:focus-visible {
 }
 
 .app-shell {
+    --scrollbar-thumb: #8496aa;
+    --scrollbar-thumb-hover: #64748b;
     background-image: radial-gradient(circle at 82% 0%, rgba(94, 215, 210, 0.08), transparent 30rem),
         radial-gradient(circle at 20% 100%, rgba(184, 243, 107, 0.05), transparent 28rem);
 }
 
-.eyebrow {
-    color: #8fa5b8;
-    font-size: 0.66rem;
-    font-weight: 700;
-    letter-spacing: 0.18em;
-    line-height: 1;
+.app-shell[data-theme="dark"] {
+    --scrollbar-thumb: #596e84;
+    --scrollbar-thumb-hover: #788da4;
 }
 
 .primary-button {
@@ -200,6 +199,35 @@ input:focus-visible {
     font-weight: 600;
 }
 
+.ps-chart {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    column-gap: 0.625rem;
+}
+
+.ps-chart-axis {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    min-width: 5ch;
+    font-size: 0.7rem;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    text-align: right;
+}
+
+.ps-chart-plot {
+    min-height: 0;
+    margin-block: 0.35rem;
+}
+
+.ps-chart-plot svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+}
+
 .threshold-value-group {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -300,9 +328,11 @@ input:focus-visible {
 }
 
 .threshold-dual-slider {
+    --threshold-thumb-size: 1.4rem;
+    --threshold-thumb-radius: calc(var(--threshold-thumb-size) / 2);
     position: relative;
     height: 3rem;
-    margin: 0 0.7rem;
+    margin: 0 var(--threshold-thumb-radius);
     isolation: isolate;
     touch-action: none;
     user-select: none;
@@ -339,9 +369,7 @@ input:focus-visible {
 
 .threshold-range {
     position: absolute;
-    inset-block: 0;
-    left: -0.7rem;
-    width: calc(100% + 1.4rem);
+    left: calc(-1 * var(--threshold-thumb-radius));
     height: 3rem;
     max-width: none;
     margin: 0;
@@ -357,10 +385,12 @@ input:focus-visible {
 }
 
 .threshold-range-low {
+    top: 0.3rem;
     z-index: 3;
 }
 
 .threshold-range-high {
+    top: -0.3rem;
     z-index: 2;
 }
 
@@ -377,8 +407,9 @@ input:focus-visible {
 }
 
 .threshold-range::-webkit-slider-thumb {
-    width: 1.4rem;
-    height: 1.4rem;
+    box-sizing: border-box;
+    width: var(--threshold-thumb-size);
+    height: var(--threshold-thumb-size);
     margin-top: -0.45rem;
     appearance: none;
     -webkit-appearance: none;
@@ -395,8 +426,9 @@ input:focus-visible {
 }
 
 .threshold-range::-moz-range-thumb {
-    width: 1.1rem;
-    height: 1.1rem;
+    box-sizing: border-box;
+    width: var(--threshold-thumb-size);
+    height: var(--threshold-thumb-size);
     border: 3px solid;
     border-radius: 50%;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28), 0 0 0 3px rgba(148, 163, 184, 0.12);
@@ -537,52 +569,30 @@ input:focus-visible {
 .shadow-black\/10 { --tw-shadow-color: rgb(0 0 0 / 0.1); }
 .shadow-cyan-500\/10 { box-shadow: 0 12px 24px rgb(6 182 212 / 0.1); }
 
-.device-list-scroll {
+.app-scroll {
     scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) transparent;
 }
 
-.device-list-scroll-dark {
-    scrollbar-color: #4a4a4a #1f1f1f;
-}
-
-.device-list-scroll-light {
-    scrollbar-color: #b0b0b0 #f3f3f3;
-}
-
-.device-list-scroll::-webkit-scrollbar {
+.app-scroll::-webkit-scrollbar {
     width: 10px;
+    height: 10px;
 }
 
-.device-list-scroll::-webkit-scrollbar-track {
+.app-scroll::-webkit-scrollbar-track,
+.app-scroll::-webkit-scrollbar-corner {
     background: transparent;
 }
 
-.device-list-scroll-dark::-webkit-scrollbar-track {
-    background: #1f1f1f;
-}
-
-.device-list-scroll-light::-webkit-scrollbar-track {
-    background: #f3f3f3;
-}
-
-.device-list-scroll-dark::-webkit-scrollbar-thumb {
-    background: #4a4a4a;
+.app-scroll::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    background-clip: padding-box;
     border-radius: 9999px;
-    border: 2px solid #1f1f1f;
+    border: 2px solid transparent;
 }
 
-.device-list-scroll-light::-webkit-scrollbar-thumb {
-    background: #b0b0b0;
-    border-radius: 9999px;
-    border: 2px solid #f3f3f3;
-}
-
-.device-list-scroll-dark::-webkit-scrollbar-thumb:hover {
-    background: #5a5a5a;
-}
-
-.device-list-scroll-light::-webkit-scrollbar-thumb:hover {
-    background: #9a9a9a;
+.app-scroll::-webkit-scrollbar-thumb:hover {
+    background-color: var(--scrollbar-thumb-hover);
 }
 
 @keyframes ripple {

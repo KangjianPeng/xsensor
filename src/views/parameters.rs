@@ -1,7 +1,11 @@
-use crate::api::ble_service::use_ble;
+use crate::api::ble_service::{use_ble, BleService};
 use crate::ble_constants::{DEVICE_NAME_UUID, PS_HIGH_UUID, PS_LOW_UUID, SERVICE_UUID};
 use crate::context::use_app_state;
+use dioxus::core::schedule_update;
 use dioxus::prelude::*;
+
+const MAX_THRESHOLD: i32 = 2048;
+const DEFAULT_THRESHOLDS: (i32, i32) = (500, MAX_THRESHOLD);
 
 #[component]
 pub fn Parameters() -> Element {
@@ -10,8 +14,8 @@ pub fn Parameters() -> Element {
     let device_id = app_state.connected_device_id.read().clone();
 
     // 参数状态
-    let mut threshold_low = use_signal(|| 500);
-    let mut threshold_high = use_signal(|| 3000);
+    let mut threshold_low = use_signal(|| DEFAULT_THRESHOLDS.0);
+    let mut threshold_high = use_signal(|| DEFAULT_THRESHOLDS.1);
     let mut device_name = use_signal(String::new);
     let mut saved_device_name = use_signal(String::new);
     let mut has_changes = use_signal(|| false);
@@ -39,8 +43,8 @@ pub fn Parameters() -> Element {
         loaded_device_id.set(id.clone());
         is_loaded.set(false);
         has_changes.set(false);
-        threshold_low.set(500);
-        threshold_high.set(3000);
+        threshold_low.set(DEFAULT_THRESHOLDS.0);
+        threshold_high.set(DEFAULT_THRESHOLDS.1);
         device_name.set(String::new());
         saved_device_name.set(String::new());
         let fallback_name = app_state
@@ -51,8 +55,6 @@ pub fn Parameters() -> Element {
             .map(|device| device.name.clone());
 
         spawn(async move {
-            let mut low = 500;
-            let mut high = 3000;
             let mut services_ready = false;
 
             // Wait for services to be discovered
@@ -73,19 +75,8 @@ pub fn Parameters() -> Element {
                 return;
             }
 
-            // 读取 PS Low (0xFFE2)
-            if let Ok(data) = ble.read(&id, SERVICE_UUID, PS_LOW_UUID).await {
-                if let Some(value) = parse_threshold_value(&data) {
-                    low = value;
-                }
-            }
-
-            // 读取 PS High (0xFFE1)
-            if let Ok(data) = ble.read(&id, SERVICE_UUID, PS_HIGH_UUID).await {
-                if let Some(value) = parse_threshold_value(&data) {
-                    high = value;
-                }
-            }
+            let device_low = read_threshold(ble, &id, PS_LOW_UUID).await.ok();
+            let device_high = read_threshold(ble, &id, PS_HIGH_UUID).await.ok();
 
             let name = ble
                 .read(&id, SERVICE_UUID, DEVICE_NAME_UUID)
@@ -96,9 +87,17 @@ pub fn Parameters() -> Element {
                 .or(fallback_name);
 
             if app_state.connected_device_id.read().as_str() == id {
-                let (low, high) = normalize_thresholds(low, high);
+                let (low, high) = normalize_thresholds(
+                    device_low.unwrap_or(DEFAULT_THRESHOLDS.0),
+                    device_high.unwrap_or(DEFAULT_THRESHOLDS.1),
+                );
                 threshold_low.set(low);
                 threshold_high.set(high);
+                has_changes.set(
+                    device_low
+                        .zip(device_high)
+                        .is_some_and(|pair| pair != (low, high)),
+                );
                 if let Some(name) = name {
                     device_name.set(name.clone());
                     saved_device_name.set(name);
@@ -113,8 +112,8 @@ pub fn Parameters() -> Element {
         div {
             class: theme
                 .pick(
-                    "h-full w-full text-gray-100 overflow-auto relative",
-                    "h-full w-full text-gray-900 overflow-auto relative",
+                    "app-scroll h-full w-full text-gray-100 overflow-auto relative",
+                    "app-scroll h-full w-full text-gray-900 overflow-auto relative",
                 ),
             if device_id.is_empty() {
                 ParametersEmptyState {}
@@ -183,7 +182,7 @@ pub fn Parameters() -> Element {
                         });
                     },
                     on_save: move |_| {
-                        if is_saving() {
+                        if is_saving() || !is_loaded() {
                             return;
                         }
                         let id = app_state.connected_device_id.read().clone();
@@ -197,22 +196,20 @@ pub fn Parameters() -> Element {
                         is_saving.set(true);
                         spawn(async move {
                             let result = async {
-                                ble
-                                .write(
-                                    &id,
-                                    SERVICE_UUID,
-                                    PS_LOW_UUID,
-                                    (low as u16).to_le_bytes().to_vec(),
-                                )
-                                .await?;
-                                ble
-                                .write(
-                                    &id,
-                                    SERVICE_UUID,
-                                    PS_HIGH_UUID,
-                                    (high as u16).to_le_bytes().to_vec(),
-                                )
-                                .await
+                                let current_high = read_threshold(ble, &id, PS_HIGH_UUID).await?;
+                                let low_write = (PS_LOW_UUID, low);
+                                let high_write = (PS_HIGH_UUID, high);
+                                // Raise the upper bound first when the new low reaches the old high.
+                                let writes = if low >= current_high {
+                                    [high_write, low_write]
+                                } else {
+                                    [low_write, high_write]
+                                };
+                                for (uuid, value) in writes {
+                                    ble.write(&id, SERVICE_UUID, uuid, (value as u16).to_le_bytes().to_vec())
+                                        .await?;
+                                }
+                                Ok::<_, String>(())
                             }
                             .await;
                             match result {
@@ -232,38 +229,45 @@ pub fn Parameters() -> Element {
                     on_reset: move |_| {
                         // 重新读取参数
                         let id = app_state.connected_device_id.read().clone();
-                        if id.is_empty() {
+                        if id.is_empty() || is_saving() || !is_loaded() {
                             return;
                         }
+                        is_loaded.set(false);
                         spawn(async move {
                             let result = async {
-                                let low_data = ble.read(&id, SERVICE_UUID, PS_LOW_UUID).await?;
-                                let low = parse_threshold_value(&low_data)
-                                    .ok_or_else(|| "PS low threshold returned an invalid value".to_string())?;
-                                let high_data = ble.read(&id, SERVICE_UUID, PS_HIGH_UUID).await?;
-                                let high = parse_threshold_value(&high_data)
-                                    .ok_or_else(|| "PS high threshold returned an invalid value".to_string())?;
-                                Ok::<_, String>(normalize_thresholds(low, high))
+                                let low = read_threshold(ble, &id, PS_LOW_UUID).await?;
+                                let high = read_threshold(ble, &id, PS_HIGH_UUID).await?;
+                                Ok::<_, String>((low, high))
                             }
                             .await;
+                            if app_state.connected_device_id.read().as_str() != id {
+                                return;
+                            }
                             match result {
-                                Ok((low, high)) if app_state.connected_device_id.read().as_str() == id => {
+                                Ok((device_low, device_high)) => {
+                                    let (low, high) = normalize_thresholds(device_low, device_high);
                                     threshold_low.set(low);
                                     threshold_high.set(high);
-                                    has_changes.set(false);
+                                    has_changes.set((low, high) != (device_low, device_high));
                                 }
-                                Ok(_) => {}
                                 Err(error) => error!("Failed to reload parameters: {error}"),
                             }
+                            is_loaded.set(true);
                         });
                     },
                     on_low_change: move |value: i32| {
-                        threshold_low.set(value.clamp(0, threshold_high() - 1));
-                        has_changes.set(true);
+                        let value = value.clamp(0, threshold_high() - 1);
+                        if value != threshold_low() {
+                            threshold_low.set(value);
+                            has_changes.set(true);
+                        }
                     },
                     on_high_change: move |value: i32| {
-                        threshold_high.set(value.clamp(threshold_low() + 1, MAX_THRESHOLD));
-                        has_changes.set(true);
+                        let value = value.clamp(threshold_low() + 1, MAX_THRESHOLD);
+                        if value != threshold_high() {
+                            threshold_high.set(value);
+                            has_changes.set(true);
+                        }
                     },
                 }
             }
@@ -420,9 +424,7 @@ fn ParametersHeader(
     rsx! {
         div { class: "page-header flex flex-col md:flex-row md:items-end md:justify-between gap-4",
             div {
-                p { class: "eyebrow", "DEVICE CONFIGURATION" }
-                h1 { class: "mt-1 text-2xl font-semibold tracking-tight", "参数设置" }
-                p { class: "mt-1 text-sm text-slate-400", "调整接近传感器的触发区间" }
+                h1 { class: "text-2xl font-semibold tracking-tight", "参数设置" }
                 if has_changes {
                     p { class: "text-xs text-yellow-400 mt-0.5", "● 有未保存的更改" }
                 }
@@ -451,10 +453,18 @@ fn ThresholdPairCard(
     on_low_change: EventHandler<i32>,
     on_high_change: EventHandler<i32>,
 ) -> Element {
-    let low_value = low_value.clamp(0, MAX_THRESHOLD - 1);
-    let high_value = high_value.clamp(low_value + 1, MAX_THRESHOLD);
-    let percentage_low = low_value as f64 / MAX_THRESHOLD as f64 * 100.0;
-    let percentage_high = high_value as f64 / MAX_THRESHOLD as f64 * 100.0;
+    let low_max = high_value - 1;
+    let high_min = low_value + 1;
+    let percentage = |value: i32| value as f64 / MAX_THRESHOLD as f64 * 100.0;
+    let percentage_low = percentage(low_value);
+    let selection_width = percentage(high_value - low_value);
+    // Each native range covers only its allowed section of the shared track.
+    let low_range_width = percentage(low_max);
+    let high_range_start = percentage(high_min);
+    let high_range_width = percentage(MAX_THRESHOLD - high_min);
+    let midpoint = MAX_THRESHOLD / 2;
+    let redraw_low = schedule_update();
+    let redraw_high = redraw_low.clone();
     let app_state = use_app_state();
     let theme = (app_state.theme)();
     let low_value_class = theme.pick(
@@ -480,7 +490,7 @@ fn ThresholdPairCard(
             div {
                 h2 { class: "text-base font-semibold mb-1", "接近传感器阈值" }
                 p { class: "text-xs text-gray-400",
-                    "拖动两侧滑块，调整传感器的触发区间"
+                    "拖动滑块或输入数值，低阈值需小于高阈值"
                 }
             }
 
@@ -493,7 +503,7 @@ fn ThresholdPairCard(
                     input {
                         r#type: "number",
                         min: "0",
-                        max: "{high_value - 1}",
+                        max: "{low_max}",
                         step: "1",
                         inputmode: "numeric",
                         value: "{low_value}",
@@ -501,8 +511,10 @@ fn ThresholdPairCard(
                         aria_label: "低阈值",
                         onchange: move |event| {
                             if let Ok(value) = event.value().parse::<i32>() {
-                                on_low_change.call(value.clamp(0, high_value - 1));
+                                on_low_change.call(value);
                             }
+                            // Restore the displayed number even if clamping left the props unchanged.
+                            redraw_low();
                         },
                     }
                 }
@@ -513,7 +525,7 @@ fn ThresholdPairCard(
                     }
                     input {
                         r#type: "number",
-                        min: "{low_value + 1}",
+                        min: "{high_min}",
                         max: "{MAX_THRESHOLD}",
                         step: "1",
                         inputmode: "numeric",
@@ -522,8 +534,9 @@ fn ThresholdPairCard(
                         aria_label: "高阈值",
                         onchange: move |event| {
                             if let Ok(value) = event.value().parse::<i32>() {
-                                on_high_change.call(value.clamp(low_value + 1, MAX_THRESHOLD));
+                                on_high_change.call(value);
                             }
+                            redraw_high();
                         },
                     }
                 }
@@ -539,47 +552,41 @@ fn ThresholdPairCard(
                     }
                     div {
                         class: "threshold-slider-selection",
-                        style: "left: {percentage_low}%; width: {percentage_high - percentage_low}%;",
+                        style: "left: {percentage_low}%; width: {selection_width}%;",
                     }
                     input {
                         r#type: "range",
                         min: "0",
-                        // Both thumbs use the complete sensor range. Restricting
-                        // the HTML max to the other thumb makes the browser map
-                        // the thumb position to a different scale on every
-                        // render, which is why the old slider appeared to jump.
-                        max: "{MAX_THRESHOLD}",
+                        max: "{low_max}",
+                        step: "1",
                         value: "{low_value}",
+                        style: "width: calc({low_range_width}% + var(--threshold-thumb-size));",
                         class: theme.pick(
                             "threshold-range threshold-range-low threshold-range-dark",
                             "threshold-range threshold-range-low threshold-range-light",
                         ),
                         aria_label: "低阈值",
-                        aria_valuemin: "0",
-                        aria_valuemax: "{MAX_THRESHOLD}",
-                        aria_valuenow: "{low_value}",
                         oninput: move |event| {
                             if let Ok(value) = event.value().parse::<i32>() {
-                                on_low_change.call(value.min(high_value - 1));
+                                on_low_change.call(value);
                             }
                         },
                     }
                     input {
                         r#type: "range",
-                        min: "0",
+                        min: "{high_min}",
                         max: "{MAX_THRESHOLD}",
+                        step: "1",
                         value: "{high_value}",
+                        style: "left: calc({high_range_start}% - var(--threshold-thumb-radius)); width: calc({high_range_width}% + var(--threshold-thumb-size));",
                         class: theme.pick(
                             "threshold-range threshold-range-high threshold-range-dark",
                             "threshold-range threshold-range-high threshold-range-light",
                         ),
                         aria_label: "高阈值",
-                        aria_valuemin: "0",
-                        aria_valuemax: "{MAX_THRESHOLD}",
-                        aria_valuenow: "{high_value}",
                         oninput: move |event| {
                             if let Ok(value) = event.value().parse::<i32>() {
-                                on_high_change.call(value.max(low_value + 1));
+                                on_high_change.call(value);
                             }
                         },
                     }
@@ -589,15 +596,13 @@ fn ThresholdPairCard(
                     "threshold-scale threshold-scale-light",
                 ),
                     span { "0" }
-                    span { "32,768" }
-                    span { "65,535" }
+                    span { "{midpoint}" }
+                    span { "{MAX_THRESHOLD}" }
                 }
             }
         }
     }
 }
-
-const MAX_THRESHOLD: i32 = u16::MAX as i32;
 
 fn normalize_thresholds(low: i32, high: i32) -> (i32, i32) {
     let low = low.clamp(0, MAX_THRESHOLD - 1);
@@ -605,10 +610,14 @@ fn normalize_thresholds(low: i32, high: i32) -> (i32, i32) {
     (low, high)
 }
 
+async fn read_threshold(ble: BleService, id: &str, uuid: &str) -> Result<i32, String> {
+    let data = ble.read(id, SERVICE_UUID, uuid).await?;
+    parse_threshold_value(&data)
+        .ok_or_else(|| format!("Threshold {uuid} returned an invalid value"))
+}
+
 fn parse_threshold_value(data: &[u8]) -> Option<i32> {
-    // Both threshold characteristics are two-byte little-endian values. Do
-    // not mask the high nibble here because a valid device value such as
-    // 0x1000 would otherwise be displayed as zero.
+    // Preserve the full BLE value so saved thresholds from older versions can be normalized.
     match data {
         [low, high] => Some(u16::from_le_bytes([*low, *high]) as i32),
         _ => None,
@@ -624,7 +633,7 @@ mod tests {
     #[test]
     fn threshold_values_keep_the_full_u16_range() {
         assert_eq!(parse_threshold_value(&[0x34, 0x12]), Some(0x1234));
-        assert_eq!(parse_threshold_value(&[0xff, 0xff]), Some(MAX_THRESHOLD));
+        assert_eq!(parse_threshold_value(&[0xff, 0xff]), Some(u16::MAX as i32));
         assert_eq!(parse_threshold_value(&[0x12]), None);
         assert_eq!(parse_threshold_value(&[0x34, 0x12, 0]), None);
     }
@@ -633,6 +642,12 @@ mod tests {
     fn threshold_pair_stays_ordered_at_range_edges() {
         assert_eq!(normalize_thresholds(-1, 0), (0, 1));
         assert_eq!(normalize_thresholds(100, 50), (100, 101));
+        assert_eq!(normalize_thresholds(100, 100), (100, 101));
+        assert_eq!(normalize_thresholds(0, MAX_THRESHOLD), (0, MAX_THRESHOLD));
+        assert_eq!(
+            normalize_thresholds(500, MAX_THRESHOLD + 1),
+            (500, MAX_THRESHOLD)
+        );
         assert_eq!(
             normalize_thresholds(70_000, 80_000),
             (MAX_THRESHOLD - 1, MAX_THRESHOLD)

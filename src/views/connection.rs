@@ -330,11 +330,7 @@ fn ConnectionHeader(
 ) -> Element {
     rsx! {
         div { class: "page-header flex flex-col md:flex-row md:items-end md:justify-between gap-4",
-            div {
-                p { class: "eyebrow", "DEVICE / LINK" }
-                h1 { class: "mt-1 text-2xl font-semibold tracking-tight", "设备连接" }
-                p { class: "mt-1 text-sm text-slate-400", "扫描并管理附近的 XSensor 边缘设备" }
-            }
+            h1 { class: "text-2xl font-semibold tracking-tight", "设备连接" }
             button {
                 class: "primary-button inline-flex items-center gap-2 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer px-4 py-2.5 text-xs font-semibold transition-all",
                 disabled: is_scanning || is_connecting,
@@ -373,8 +369,8 @@ fn DeviceList(
 ) -> Element {
     let theme = *crate::context::use_app_state().theme.read();
     let container_class = theme.pick(
-        "rounded-2xl border border-white/10 bg-white/[0.03] divide-y divide-white/10 shadow-2xl shadow-black/20 overflow-y-auto max-h-[70vh] device-list-scroll device-list-scroll-dark",
-        "rounded-2xl border border-slate-200 bg-white divide-y divide-slate-100 shadow-sm overflow-y-auto max-h-[70vh] device-list-scroll device-list-scroll-light",
+        "app-scroll rounded-2xl border border-white/10 bg-white/[0.03] divide-y divide-white/10 shadow-2xl shadow-black/20 overflow-y-auto max-h-[70vh]",
+        "app-scroll rounded-2xl border border-slate-200 bg-white divide-y divide-slate-100 shadow-sm overflow-y-auto max-h-[70vh]",
     );
     rsx! {
         div { class: "{container_class}",

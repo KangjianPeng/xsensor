@@ -50,7 +50,9 @@ pub fn Navbar() -> Element {
     let brand_border = theme.pick("border-white/10", "border-slate-200");
 
     rsx! {
-        div { class: "app-shell flex flex-col h-screen w-full {root_bg} {text_color} font-sans overflow-hidden",
+        div {
+            class: "app-shell flex flex-col h-screen w-full {root_bg} {text_color} font-sans overflow-hidden",
+            "data-theme": theme.pick("dark", "light"),
             // 自定义标题栏
             TitleBar {}
 
@@ -60,10 +62,7 @@ pub fn Navbar() -> Element {
                     div { class: "px-5 pb-5 mb-3 border-b {brand_border}",
                         div { class: "flex items-center gap-3",
                             img { class: "w-10 h-10 rounded-xl shadow-lg shadow-cyan-500/10", src: APP_ICON, alt: "XSensor" }
-                            div {
-                                div { class: "text-sm font-semibold tracking-wide", "XSensor" }
-                                div { class: "text-[10px] text-slate-400 tracking-[0.18em] uppercase", "Sensor Console" }
-                            }
+                            div { class: "text-sm font-semibold tracking-wide", "XSensor" }
                         }
                         div { class: "mt-4 flex items-center gap-2 text-[11px] {theme.pick(\"text-slate-400\", \"text-slate-500\")}",
                             span { class: if is_connected { "status-dot status-dot-online" } else { "status-dot status-dot-offline" } }
@@ -95,7 +94,7 @@ pub fn Navbar() -> Element {
                     }
                 }
 
-                main { class: "flex-1 overflow-y-auto {main_bg} px-5 py-5",
+                main { class: "app-scroll flex-1 overflow-y-auto {main_bg} px-5 py-5",
                     Outlet::<Route> {}
                 }
             }

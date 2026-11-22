@@ -3,10 +3,13 @@ use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFi
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use dioxus::prelude::info;
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+const GATT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(3);
 
 // Simple error type
 #[derive(Debug)]
@@ -26,8 +29,14 @@ impl BleError {
 pub struct BleManager {
     adapter: Option<Adapter>,
     known_peripherals: HashMap<String, Arc<Peripheral>>,
-    connected_peripherals: HashMap<String, Arc<Peripheral>>,
+    connected_peripherals: HashMap<String, GattSession>,
     is_scanning: bool,
+}
+
+struct GattSession {
+    peripheral: Arc<Peripheral>,
+    last_discovery: Option<Instant>,
+    subscriptions: HashSet<(Uuid, Uuid)>,
 }
 
 impl BleManager {
@@ -198,6 +207,11 @@ impl BleManager {
     }
 
     pub async fn connect(&mut self, id: String) -> Result<(), BleError> {
+        // Release stale GATT handles after a link loss before a manual connection.
+        if self.connected_session(&id).await.is_ok() {
+            return Ok(());
+        }
+
         let adapter = self.ensure_adapter().await?;
         let peripherals = adapter
             .peripherals()
@@ -229,14 +243,23 @@ impl BleManager {
         }
 
         self.known_peripherals.insert(id.clone(), p.clone());
-        self.connected_peripherals.insert(id, p);
+        self.connected_peripherals.insert(
+            id,
+            GattSession {
+                peripheral: p,
+                last_discovery: None,
+                subscriptions: HashSet::new(),
+            },
+        );
 
         Ok(())
     }
 
     pub async fn disconnect(&mut self, id: String) -> Result<(), BleError> {
-        if let Some(p) = self.connected_peripherals.get(&id) {
-            p.disconnect()
+        if let Some(session) = self.connected_peripherals.get(&id) {
+            session
+                .peripheral
+                .disconnect()
                 .await
                 .map_err(|e| BleError::new(e.to_string()))?;
             self.connected_peripherals.remove(&id);
@@ -244,144 +267,89 @@ impl BleManager {
         Ok(())
     }
 
-    async fn connected_peripheral(&mut self, id: &str) -> Result<Arc<Peripheral>, BleError> {
-        let p = self
-            .connected_peripherals
-            .get(id)
-            .cloned()
-            .ok_or_else(|| BleError::new("Device not connected"))?;
-
-        if p.is_connected().await.unwrap_or(false) {
-            return Ok(p);
+    async fn connected_session(&mut self, id: &str) -> Result<&mut GattSession, BleError> {
+        if let Entry::Occupied(entry) = self.connected_peripherals.entry(id.to_owned()) {
+            if entry.get().peripheral.is_connected().await.unwrap_or(false) {
+                return Ok(entry.into_mut());
+            }
+            // Release GATT handles after link loss so only a manual connect starts a new session.
+            let session = entry.remove();
+            let _ = session.peripheral.disconnect().await;
         }
-
-        self.connected_peripherals.remove(id);
-        // Release GATT handles after link loss so only a manual connect starts a new session.
-        let _ = p.disconnect().await;
         Err(BleError::new("Device not connected"))
     }
 
     async fn get_characteristic(
         &mut self,
-        peri_id: &str,
+        id: &str,
         service_uuid: &str,
         char_uuid: &str,
-    ) -> Result<(Arc<Peripheral>, btleplug::api::Characteristic), BleError> {
-        let p = self.connected_peripheral(peri_id).await?;
-
-        let service_uuid_obj = Uuid::from_str(service_uuid)
-            .map_err(|e| BleError::new(format!("Invalid service UUID: {}", e)))?;
-        let char_uuid_obj = Uuid::from_str(char_uuid)
-            .map_err(|e| BleError::new(format!("Invalid characteristic UUID: {}", e)))?;
-
-        let chars = p.characteristics();
-        if let Some(c) = chars
-            .into_iter()
-            .find(|c| c.service_uuid == service_uuid_obj && c.uuid == char_uuid_obj)
-        {
-            return Ok((p, c));
+    ) -> Result<(&mut GattSession, btleplug::api::Characteristic), BleError> {
+        let session = self.connected_session(id).await?;
+        let p = &session.peripheral;
+        let service = Uuid::from_str(service_uuid)
+            .map_err(|e| BleError::new(format!("Invalid service UUID: {e}")))?;
+        let uuid = Uuid::from_str(char_uuid)
+            .map_err(|e| BleError::new(format!("Invalid characteristic UUID: {e}")))?;
+        let find_characteristic = || {
+            p.characteristics()
+                .into_iter()
+                .find(|c| c.service_uuid == service && c.uuid == uuid)
+        };
+        if let Some(characteristic) = find_characteristic() {
+            return Ok((session, characteristic));
         }
-        Err(BleError::new(format!(
-            "Characteristic not found: {}",
-            char_uuid,
-        )))
-    }
 
-    async fn refresh_peripheral(&mut self, peri_id: &str) -> Result<(), BleError> {
-        self.connected_peripheral(peri_id).await?;
-        let adapter = self.ensure_adapter().await?;
-        let peripherals = adapter
-            .peripherals()
-            .await
-            .map_err(|e| BleError::new(e.to_string()))?;
-
-        if let Some(fresh_p) = peripherals
-            .into_iter()
-            .find(|p| p.id().to_string() == peri_id)
+        // A populated service cache can still be missing the requested sensor
+        // characteristic. Limit discovery retries across all callers on this link.
+        if session
+            .last_discovery
+            .is_none_or(|attempt| attempt.elapsed() >= GATT_DISCOVERY_INTERVAL)
         {
-            let fresh_p = Arc::new(fresh_p);
-            // 检查是否已连接
-            if fresh_p.is_connected().await.unwrap_or(false) {
-                // 确保服务已发现
-                if fresh_p.services().is_empty() {
-                    fresh_p
-                        .discover_services()
-                        .await
-                        .map_err(|e| BleError::new(e.to_string()))?;
-                }
-                self.known_peripherals
-                    .insert(peri_id.to_string(), fresh_p.clone());
-                self.connected_peripherals
-                    .insert(peri_id.to_string(), fresh_p);
-                return Ok(());
+            let result = p.discover_services().await;
+            session.last_discovery = Some(Instant::now());
+            result.map_err(|e| {
+                BleError::new(format!("GATT discovery for {char_uuid} failed ({e})"))
+            })?;
+            if let Some(characteristic) = find_characteristic() {
+                return Ok((session, characteristic));
             }
         }
-        Err(BleError::new("Device not found or disconnected"))
+
+        Err(BleError::new(format!(
+            "Characteristic {char_uuid} is missing from GATT service {service_uuid}",
+        )))
     }
 
     pub async fn read(
         &mut self,
-        peri_id: &str,
+        id: &str,
         service_uuid: &str,
         char_uuid: &str,
     ) -> Result<Vec<u8>, BleError> {
-        let (p, char) = match self
-            .get_characteristic(peri_id, service_uuid, char_uuid)
+        let (session, characteristic) =
+            self.get_characteristic(id, service_uuid, char_uuid).await?;
+        session
+            .peripheral
+            .read(&characteristic)
             .await
-        {
-            Ok(res) => res,
-            Err(_) => {
-                self.refresh_peripheral(peri_id).await?;
-                self.get_characteristic(peri_id, service_uuid, char_uuid)
-                    .await?
-            }
-        };
-
-        match p.read(&char).await {
-            Ok(data) => Ok(data),
-            Err(_) => {
-                self.refresh_peripheral(peri_id).await?;
-                let (p, char) = self
-                    .get_characteristic(peri_id, service_uuid, char_uuid)
-                    .await?;
-                p.read(&char)
-                    .await
-                    .map_err(|e| BleError::new(e.to_string()))
-            }
-        }
+            .map_err(|e| BleError::new(format!("Read {char_uuid} failed ({e})")))
     }
 
     pub async fn write(
         &mut self,
-        peri_id: &str,
+        id: &str,
         service_uuid: &str,
         char_uuid: &str,
         value: Vec<u8>,
     ) -> Result<(), BleError> {
-        let (p, char) = match self
-            .get_characteristic(peri_id, service_uuid, char_uuid)
+        let (session, characteristic) =
+            self.get_characteristic(id, service_uuid, char_uuid).await?;
+        session
+            .peripheral
+            .write(&characteristic, &value, WriteType::WithResponse)
             .await
-        {
-            Ok(res) => res,
-            Err(_) => {
-                self.refresh_peripheral(peri_id).await?;
-                self.get_characteristic(peri_id, service_uuid, char_uuid)
-                    .await?
-            }
-        };
-
-        match p.write(&char, &value, WriteType::WithResponse).await {
-            Ok(_) => Ok(()),
-            Err(_) => {
-                self.refresh_peripheral(peri_id).await?;
-                let (p, char) = self
-                    .get_characteristic(peri_id, service_uuid, char_uuid)
-                    .await?;
-                p.write(&char, &value, WriteType::WithResponse)
-                    .await
-                    .map_err(|e| BleError::new(e.to_string()))
-            }
-        }
+            .map_err(|e| BleError::new(format!("Write {char_uuid} failed ({e})")))
     }
 
     pub async fn subscribe(
@@ -391,57 +359,44 @@ impl BleManager {
         char_uuid: &str,
     ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = NotificationData> + Send>>, BleError>
     {
-        let (p, char) = match self.get_characteristic(id, service_uuid, char_uuid).await {
-            Ok(characteristic) => characteristic,
-            Err(_) => {
-                self.refresh_peripheral(id).await?;
-                self.get_characteristic(id, service_uuid, char_uuid).await?
-            }
-        };
-
-        // Register the notification stream before subscribing so the first value is not lost.
-        let mut s = p
+        let (session, characteristic) =
+            self.get_characteristic(id, service_uuid, char_uuid).await?;
+        let p = &session.peripheral;
+        let stream = p
             .notifications()
             .await
             .map_err(|e| BleError::new(e.to_string()))?;
-        if p.subscribe(&char).await.is_err() {
-            self.refresh_peripheral(id).await?;
-            let (refreshed_p, refreshed_char) =
-                self.get_characteristic(id, service_uuid, char_uuid).await?;
-            s = refreshed_p
-                .notifications()
-                .await
-                .map_err(|e| BleError::new(e.to_string()))?;
-            refreshed_p
-                .subscribe(&refreshed_char)
-                .await
-                .map_err(|e| BleError::new(e.to_string()))?;
+
+        // Keep one callback per characteristic for the lifetime of this connection.
+        let subscription = (characteristic.service_uuid, characteristic.uuid);
+        if !session.subscriptions.contains(&subscription) {
+            if let Err(e) = p.subscribe(&characteristic).await {
+                // Clear a partially established subscription before allowing a retry.
+                let _ = p.unsubscribe(&characteristic).await;
+                return Err(BleError::new(format!("Subscribe {char_uuid} failed ({e})")));
+            }
+            session.subscriptions.insert(subscription);
         }
 
-        let target_uuid = char.uuid;
+        let target_uuid = characteristic.uuid;
         Ok(Box::pin(
-            s.filter(move |v| {
-                let is_match = v.uuid == target_uuid;
-                async move { is_match }
-            })
-            .map(|v| NotificationData {
-                uuid: v.uuid.to_string(),
-                value: v.value,
-            }),
+            stream
+                .filter(move |v| futures::future::ready(v.uuid == target_uuid))
+                .map(|v| NotificationData {
+                    uuid: v.uuid.to_string(),
+                    value: v.value,
+                }),
         ))
     }
+
     pub async fn is_connected(&mut self, id: &str) -> bool {
-        self.connected_peripheral(id).await.is_ok()
+        self.connected_session(id).await.is_ok()
     }
 
-    pub async fn list_characteristics(&self, id: &str) -> Result<Vec<UiService>, BleError> {
-        let p = self
-            .connected_peripherals
-            .get(id)
-            .ok_or(BleError::new("Device not connected"))?;
-
+    pub async fn list_characteristics(&mut self, id: &str) -> Result<Vec<UiService>, BleError> {
+        let session = self.connected_session(id).await?;
         let mut ui_services = Vec::new();
-        for service in p.services() {
+        for service in session.peripheral.services() {
             let mut ui_chars = Vec::new();
             for char in service.characteristics {
                 ui_chars.push(UiCharacteristic {
