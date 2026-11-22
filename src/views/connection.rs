@@ -6,6 +6,8 @@ use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 
 const SERVICE_UUID: &str = "0000ffe0-0000-1000-8000-00805f9b34fb";
+const DEVICE_SORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+const SCAN_CONNECT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[component]
 pub fn Connection() -> Element {
@@ -15,7 +17,9 @@ pub fn Connection() -> Element {
     let expanded_devices = use_signal(HashSet::<String>::new);
     let loading_services = use_signal(HashSet::<String>::new);
     let device_services = use_signal(HashMap::<String, Vec<UiService>>::new);
+    let mut connecting_device_id = use_signal(String::new);
     let mut adapter_available = use_signal(|| true);
+    let mut connection_error = use_signal(|| None::<String>);
 
     use_resource(move || async move {
         if let Ok(available) = crate::api::ble::is_adapter_available().await {
@@ -25,20 +29,33 @@ pub fn Connection() -> Element {
 
     let connect_task = use_coroutine(move |mut rx: UnboundedReceiver<String>| {
         let ble = ble;
+        let mut connecting_device_id = connecting_device_id;
         async move {
             while let Some(dev_id) = rx.next().await {
-                if (app_state.is_scanning)() {
-                    let _ = ble.stop_scan().await;
-                    app_state.is_scanning.set(false);
-                }
-
                 app_state.is_connecting.set(true);
-                if let Err(e) = ble.connect(dev_id.clone()).await {
-                    error!("Failed to connect to device: {}", e.to_string());
-                } else {
-                    app_state.connected_device_id.set(dev_id);
-                    app_state.scanned_devices.set(ble.get_devices().await);
+                connecting_device_id.set(dev_id.clone());
+                connection_error.set(None);
+                if let Err(error) = ble.stop_scan().await {
+                    error!("Failed to stop BLE scan before connecting: {error}");
                 }
+                app_state.is_scanning.set(false);
+
+                match ble.connect(dev_id.clone()).await {
+                    Ok(()) => {
+                        app_state.connected_device_id.set(dev_id);
+                        let mut devices = merge_device_snapshot(
+                            &app_state.scanned_devices.read(),
+                            ble.get_devices().await,
+                        );
+                        sort_device_snapshot(&mut devices);
+                        app_state.scanned_devices.set(devices);
+                    }
+                    Err(error) => {
+                        error!("Failed to connect to device: {error}");
+                        connection_error.set(Some(error));
+                    }
+                }
+                connecting_device_id.set(String::new());
                 app_state.is_connecting.set(false);
             }
         }
@@ -67,20 +84,31 @@ pub fn Connection() -> Element {
                     Ok(mut stream) => {
                         let timeout = tokio::time::sleep(std::time::Duration::from_secs(8));
                         tokio::pin!(timeout);
+                        let mut last_sort = None::<tokio::time::Instant>;
                         loop {
                             tokio::select! {
                                 _ = &mut timeout => {
                                     break;
+                                }
+                                _ = tokio::time::sleep(SCAN_CONNECT_CHECK_INTERVAL) => {
+                                    if (app_state.is_connecting)() {
+                                        break;
+                                    }
                                 }
                                 Some(new_devices) = stream.next() => {
                                     if (app_state.is_connecting)() {
                                         break;
                                     }
                                     if !new_devices.is_empty() {
-                                        let merged = merge_device_snapshot(
-                                            &app_state.scanned_devices.read(),
-                                            new_devices,
-                                        );
+                                        let current = app_state.scanned_devices.read().clone();
+                                        let mut merged = merge_device_snapshot(&current, new_devices);
+                                        let should_sort = last_sort
+                                            .map(|last_sort| last_sort.elapsed() >= DEVICE_SORT_INTERVAL)
+                                            .unwrap_or(true);
+                                        if should_sort {
+                                            sort_device_snapshot(&mut merged);
+                                            last_sort = Some(tokio::time::Instant::now());
+                                        }
                                         if merged != *app_state.scanned_devices.read() {
                                             app_state.scanned_devices.set(merged);
                                         }
@@ -91,7 +119,11 @@ pub fn Connection() -> Element {
                     }
                     Err(e) => error!("Scan failed: {}", e),
                 }
-                let _ = ble.stop_scan().await;
+                if !(app_state.is_connecting)() {
+                    if let Err(error) = ble.stop_scan().await {
+                        error!("Failed to stop BLE scan: {error}");
+                    }
+                }
                 app_state.is_scanning.set(false);
             }
         }
@@ -110,7 +142,8 @@ pub fn Connection() -> Element {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             if !(app_state.is_scanning)() && !(app_state.is_connecting)() {
                 let incoming = ble.get_devices().await;
-                let merged = merge_device_snapshot(&app_state.scanned_devices.read(), incoming);
+                let mut merged = merge_device_snapshot(&app_state.scanned_devices.read(), incoming);
+                sort_device_snapshot(&mut merged);
                 if merged != *app_state.scanned_devices.read() {
                     app_state.scanned_devices.set(merged);
                 }
@@ -147,6 +180,7 @@ pub fn Connection() -> Element {
                 ConnectionHeader {
                     is_scanning: (app_state.is_scanning)(),
                     is_connecting: (app_state.is_connecting)(),
+                    connection_error: connection_error(),
                     on_scan: move |_| {
                         scan_task.send(());
                     },
@@ -161,11 +195,16 @@ pub fn Connection() -> Element {
                             DeviceList {
                                 devices: devices.clone(),
                                 connected_device_id: app_state.connected_device_id.read().clone(),
+                                connecting_device_id: connecting_device_id.read().clone(),
+                                is_connecting: (app_state.is_connecting)(),
                                 expanded_devices,
                                 loading_services,
                                 device_services,
                                 on_connect: move |dev_id: String| {
                                     if !(app_state.is_connecting)() {
+                                        app_state.is_connecting.set(true);
+                                        connecting_device_id.set(dev_id.clone());
+                                        connection_error.set(None);
                                         connect_task.send(dev_id);
                                     }
                                 },
@@ -224,23 +263,71 @@ pub fn Connection() -> Element {
 }
 
 fn merge_device_snapshot(current: &[UiDevice], incoming: Vec<UiDevice>) -> Vec<UiDevice> {
-    let mut devices = current
-        .iter()
-        .cloned()
-        .map(|device| (device.id.clone(), device))
-        .collect::<HashMap<_, _>>();
-
+    let mut devices = current.to_vec();
     for device in incoming {
-        devices.insert(device.id.clone(), device);
+        if let Some(existing) = devices.iter_mut().find(|existing| existing.id == device.id) {
+            *existing = device;
+        } else {
+            devices.push(device);
+        }
     }
 
-    let mut devices = devices.into_values().collect::<Vec<_>>();
-    devices.sort_by(|a, b| a.id.cmp(&b.id));
     devices
 }
 
+fn sort_device_snapshot(devices: &mut [UiDevice]) {
+    devices.sort_by(|a, b| {
+        b.is_connected
+            .cmp(&a.is_connected)
+            .then_with(|| b.rssi.cmp(&a.rssi))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sort_device_snapshot, UiDevice};
+
+    #[test]
+    fn sorts_connected_devices_then_signal_strength_and_id() {
+        let mut devices = vec![
+            device("unknown", false, None),
+            device("weak", false, Some(-80)),
+            device("connected", true, Some(-95)),
+            device("strong-b", false, Some(-45)),
+            device("strong-a", false, Some(-45)),
+        ];
+
+        sort_device_snapshot(&mut devices);
+
+        let ids = devices
+            .iter()
+            .map(|device| device.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            ["connected", "strong-a", "strong-b", "weak", "unknown"]
+        );
+    }
+
+    fn device(id: &str, is_connected: bool, rssi: Option<i16>) -> UiDevice {
+        UiDevice {
+            id: id.to_string(),
+            name: id.to_string(),
+            is_connected,
+            rssi,
+            services: Vec::new(),
+        }
+    }
+}
+
 #[component]
-fn ConnectionHeader(is_scanning: bool, is_connecting: bool, on_scan: EventHandler<()>) -> Element {
+fn ConnectionHeader(
+    is_scanning: bool,
+    is_connecting: bool,
+    connection_error: Option<String>,
+    on_scan: EventHandler<()>,
+) -> Element {
     rsx! {
         div { class: "page-header flex flex-col md:flex-row md:items-end md:justify-between gap-4",
             div {
@@ -263,6 +350,11 @@ fn ConnectionHeader(is_scanning: bool, is_connecting: bool, on_scan: EventHandle
                 }
             }
         }
+        if let Some(error) = connection_error {
+            div { class: "alert-panel rounded-2xl border border-red-400/30 bg-red-500/10 p-3.5 text-red-300 text-sm",
+                "连接失败：{error}"
+            }
+        }
     }
 }
 
@@ -270,6 +362,8 @@ fn ConnectionHeader(is_scanning: bool, is_connecting: bool, on_scan: EventHandle
 fn DeviceList(
     devices: Vec<UiDevice>,
     connected_device_id: String,
+    connecting_device_id: String,
+    is_connecting: bool,
     expanded_devices: Signal<HashSet<String>>,
     loading_services: Signal<HashSet<String>>,
     device_services: Signal<HashMap<String, Vec<UiService>>>,
@@ -289,6 +383,8 @@ fn DeviceList(
                     DeviceEntry {
                         device: dev.clone(),
                         is_connected: dev.id == connected_device_id,
+                        is_connecting,
+                        is_pending: dev.id == connecting_device_id,
                         is_expanded: expanded_devices.read().contains(&dev.id),
                         loading: loading_services.read().contains(&dev.id),
                         services: device_services.read().get(&dev.id).cloned(),
@@ -306,6 +402,8 @@ fn DeviceList(
 fn DeviceEntry(
     device: UiDevice,
     is_connected: bool,
+    is_connecting: bool,
+    is_pending: bool,
     is_expanded: bool,
     loading: bool,
     services: Option<Vec<UiService>>,
@@ -404,9 +502,15 @@ fn DeviceEntry(
                     }
                 } else {
                     button {
-                        class: "inline-flex items-center justify-center rounded-lg bg-[#60cd18] hover:bg-[#6fe12a] cursor-pointer px-2.5 py-1 text-xs font-medium text-gray-900 transition-colors",
+                        class: "inline-flex items-center justify-center gap-2 rounded-lg bg-[#60cd18] hover:bg-[#6fe12a] disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer px-2.5 py-1 text-xs font-medium text-gray-900 transition-colors",
+                        disabled: is_connecting,
                         onclick: move |_| on_connect.call(dev_id.clone()),
-                        "连接"
+                        if is_pending {
+                            span { class: "animate-spin inline-block w-3 h-3 border-2 border-gray-900 border-t-transparent rounded-full" }
+                            "正在连接..."
+                        } else {
+                            "连接"
+                        }
                     }
                 }
             }
