@@ -207,28 +207,6 @@ pub fn Status() -> Element {
             if id.is_empty() {
                 return;
             }
-            // Wait for the PS data characteristic to be discovered.
-            loop {
-                if cancelled() {
-                    return;
-                }
-                if let Ok(services) = ble.list_characteristics(id.clone()).await {
-                    let available = services
-                        .iter()
-                        .find(|service| service.uuid == SERVICE_UUID)
-                        .and_then(|service| {
-                            service
-                                .characteristic
-                                .iter()
-                                .find(|characteristic| characteristic.uuid == PS_DATA_UUID)
-                        })
-                        .is_some();
-                    if available {
-                        break;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
 
             let mut first_sample = true;
             let mut invalid_sample_logged = false;
@@ -251,7 +229,15 @@ pub fn Status() -> Element {
                                 "read",
                             );
                         }
-                        Err(e) => error!("Failed to read PS data: {}", e),
+                        Err(e) => {
+                            // The Windows BLE service cache can lag behind the
+                            // completed connection. BleManager::read refreshes
+                            // that cache on failure, so retry instead of leaving
+                            // the view in a permanent waiting state.
+                            error!("Failed to read PS data: {}", e);
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
                     }
                     let delay = 1000 / freq as u64;
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
