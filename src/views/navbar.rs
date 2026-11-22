@@ -15,21 +15,17 @@ pub fn Navbar() -> Element {
     let mut app_state = use_app_state();
     let ble = use_ble();
 
-    // 轮询检查连接状态
-    use_future(move || {
-        let ble = ble;
-        async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let current_id = app_state.connected_device_id.read().clone();
-                if !current_id.is_empty() {
-                    if ble.is_connected(current_id.clone()).await {
-                        // connected
-                    } else {
-                        app_state.connected_device_id.set(String::new());
-                        app_state.scanned_devices.set(ble.get_devices().await);
-                    }
-                }
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let current_id = app_state.connected_device_id.read().clone();
+            if !current_id.is_empty()
+                && !(app_state.is_connecting)()
+                && !ble.is_connected(current_id.clone()).await
+                && app_state.connected_device_id.read().as_str() == current_id
+                && !(app_state.is_connecting)()
+            {
+                app_state.connected_device_id.set(String::new());
             }
         }
     });

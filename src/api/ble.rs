@@ -181,17 +181,6 @@ impl BleManager {
                 .unwrap_or_default();
             let is_connected = p.is_connected().await.unwrap_or_default();
 
-            // Windows can briefly report false while service discovery is
-            // still completing, so only replace the connection cache when a
-            // peripheral is confirmed connected. The connection watchdog and
-            // explicit disconnect path remove stale entries.
-            if is_connected && !self.connected_peripherals.contains_key(id) {
-                // Keep the instance that completed service discovery. Replacing it
-                // with the scan snapshot can drop the characteristic cache while
-                // the status page is polling or receiving notifications.
-                self.connected_peripherals.insert(id.clone(), p.clone());
-            }
-
             p_list.push(UiDevice {
                 id: id.clone(),
                 name,
@@ -246,29 +235,39 @@ impl BleManager {
     }
 
     pub async fn disconnect(&mut self, id: String) -> Result<(), BleError> {
-        let p = self.known_peripherals.get(&id).cloned();
-        if let Some(p) = p {
+        if let Some(p) = self.connected_peripherals.get(&id) {
             p.disconnect()
                 .await
                 .map_err(|e| BleError::new(e.to_string()))?;
-            self.connected_peripherals.remove(&id.to_string());
-        } else {
-            return Err(BleError::new("Peripheral not found"));
+            self.connected_peripherals.remove(&id);
         }
         Ok(())
     }
 
+    async fn connected_peripheral(&mut self, id: &str) -> Result<Arc<Peripheral>, BleError> {
+        let p = self
+            .connected_peripherals
+            .get(id)
+            .cloned()
+            .ok_or_else(|| BleError::new("Device not connected"))?;
+
+        if p.is_connected().await.unwrap_or(false) {
+            return Ok(p);
+        }
+
+        self.connected_peripherals.remove(id);
+        // Release GATT handles after link loss so only a manual connect starts a new session.
+        let _ = p.disconnect().await;
+        Err(BleError::new("Device not connected"))
+    }
+
     async fn get_characteristic(
-        &self,
+        &mut self,
         peri_id: &str,
         service_uuid: &str,
         char_uuid: &str,
     ) -> Result<(Arc<Peripheral>, btleplug::api::Characteristic), BleError> {
-        let p = self
-            .connected_peripherals
-            .get(peri_id)
-            .cloned()
-            .ok_or(BleError::new("Device not connected"))?;
+        let p = self.connected_peripheral(peri_id).await?;
 
         let service_uuid_obj = Uuid::from_str(service_uuid)
             .map_err(|e| BleError::new(format!("Invalid service UUID: {}", e)))?;
@@ -289,6 +288,7 @@ impl BleManager {
     }
 
     async fn refresh_peripheral(&mut self, peri_id: &str) -> Result<(), BleError> {
+        self.connected_peripheral(peri_id).await?;
         let adapter = self.ensure_adapter().await?;
         let peripherals = adapter
             .peripherals()
@@ -302,10 +302,6 @@ impl BleManager {
             let fresh_p = Arc::new(fresh_p);
             // 检查是否已连接
             if fresh_p.is_connected().await.unwrap_or(false) {
-                self.known_peripherals
-                    .insert(peri_id.to_string(), fresh_p.clone());
-                self.connected_peripherals
-                    .insert(peri_id.to_string(), fresh_p.clone());
                 // 确保服务已发现
                 if fresh_p.services().is_empty() {
                     fresh_p
@@ -313,6 +309,10 @@ impl BleManager {
                         .await
                         .map_err(|e| BleError::new(e.to_string()))?;
                 }
+                self.known_peripherals
+                    .insert(peri_id.to_string(), fresh_p.clone());
+                self.connected_peripherals
+                    .insert(peri_id.to_string(), fresh_p);
                 return Ok(());
             }
         }
@@ -430,21 +430,8 @@ impl BleManager {
             }),
         ))
     }
-    pub async fn is_connected(&mut self, id: String) -> Result<bool, BleError> {
-        if let Some(p) = self.connected_peripherals.get(&id) {
-            if p.is_connected().await.unwrap_or(false) {
-                return Ok(true);
-            }
-        }
-
-        // Try to refresh if not found or check failed
-        if self.refresh_peripheral(&id).await.is_ok() {
-            return Ok(true);
-        }
-
-        // If refresh failed, ensure it's removed from connected list
-        self.connected_peripherals.remove(&id);
-        Ok(false)
+    pub async fn is_connected(&mut self, id: &str) -> bool {
+        self.connected_peripheral(id).await.is_ok()
     }
 
     pub async fn list_characteristics(&self, id: &str) -> Result<Vec<UiService>, BleError> {
@@ -495,4 +482,23 @@ pub async fn is_adapter_available() -> Result<bool, BleError> {
         .await
         .map_err(|e| BleError::new(e.to_string()))?;
     Ok(!adpaters.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BleManager;
+    use crate::ble_constants::{PS_DATA_UUID, SERVICE_UUID};
+
+    #[tokio::test]
+    async fn reading_without_a_manual_connection_leaves_the_adapter_unopened() {
+        let mut manager = BleManager::new();
+
+        let error = manager
+            .read("unconnected", SERVICE_UUID, PS_DATA_UUID)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "Device not connected");
+        assert!(manager.adapter.is_none());
+    }
 }

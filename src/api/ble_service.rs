@@ -159,7 +159,7 @@ pub fn use_ble_provider() {
                     let _ = reply.send(manager.disconnect(id).await.map_err(|e| e.to_string()));
                 }
                 BleRequest::IsConnected(id, reply) => {
-                    let _ = reply.send(manager.is_connected(id).await.unwrap_or(false));
+                    let _ = reply.send(manager.is_connected(&id).await);
                 }
                 BleRequest::Read(id, service, char, reply) => {
                     let _ = reply.send(
