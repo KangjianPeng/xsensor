@@ -16,7 +16,6 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       BUNDLE_DIR: target/dx/xsensor/bundle/linux
-      BUNDLE_ARCHIVE: ${{ github.event.repository.name }}-linux.tar.gz
       BUNDLE_ARTIFACT_NAME: ${{ github.event.repository.name }}-linux-bundle
     steps:
       - name: Checkout sources
@@ -85,37 +84,40 @@ jobs:
             echo "Bundle failed: directory $BUNDLE_DIR not created. Check the 'Bundle desktop release' step logs."
             exit 1
           fi
-          
-          # Create a staging directory for final artifacts only
+
           mkdir -p staging
-          
-          # Copy only the final package files (.deb, .rpm, .AppImage)
-          find "$BUNDLE_DIR" -maxdepth 2 -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \) -exec cp {} staging/ \;
-          
+          find "$BUNDLE_DIR" -maxdepth 2 -type f \
+            \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \) \
+            -exec cp {} staging/ \;
+
+          if [ -z "$(find staging -maxdepth 1 -type f -print -quit)" ]; then
+            echo "No final Linux packages were produced."
+            exit 1
+          fi
+
           echo "Final artifacts:"
           ls -lh staging/
-          
-          # Package only the final artifacts
-          tar -czvf "$BUNDLE_ARCHIVE" -C staging .
-          echo "Archive created: $(ls -lh "$BUNDLE_ARCHIVE")"
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUNDLE_ARTIFACT_NAME }}
-          path: ${{ env.BUNDLE_ARCHIVE }}
+          path: staging/*
+          if-no-files-found: error
 
       - name: Attach bundle to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.BUNDLE_ARCHIVE }}
+          files: |
+            staging/*.deb
+            staging/*.rpm
+            staging/*.AppImage
 
   bundle-windows:
     runs-on: windows-latest
     env:
       BUNDLE_DIR: target/dx/xsensor/bundle/windows/nsis
-      BUNDLE_ARCHIVE: ${{ github.event.repository.name }}-windows.zip
       BUNDLE_ARTIFACT_NAME: ${{ github.event.repository.name }}-windows-bundle
     steps:
       - name: Checkout sources
@@ -148,16 +150,32 @@ jobs:
             Write-Error "Bundle failed: directory $env:BUNDLE_DIR not created."
             exit 1
           }
-          Compress-Archive -Path "$env:BUNDLE_DIR\*" -DestinationPath $env:BUNDLE_ARCHIVE
+
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Get-ChildItem -Path $env:BUNDLE_DIR -Recurse -File |
+            Where-Object { $_.Extension -in @('.exe', '.msi') } |
+            Copy-Item -Destination staging
+
+          $packages = Get-ChildItem -Path staging -File
+          if ($packages.Count -eq 0) {
+            Write-Error "No final Windows packages were produced."
+            exit 1
+          }
+
+          Write-Host "Final artifacts:"
+          $packages | Format-Table Name,Length
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUNDLE_ARTIFACT_NAME }}
-          path: ${{ env.BUNDLE_ARCHIVE }}
+          path: staging/*
+          if-no-files-found: error
 
       - name: Attach bundle to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.BUNDLE_ARCHIVE }}
+          files: |
+            staging/*.exe
+            staging/*.msi
