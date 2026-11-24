@@ -59,7 +59,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends imagemagick
 
-          # Generate a square 512x512 PNG for AppImage and verify it exists.
+          # Generate a square 512x512 PNG package icon and verify it exists.
           # ICO files contain multiple images; extract the first one [0] and resize.
           mkdir -p icons
           convert 'icons/icon.ico[0]' -resize 512x512 icons/icon.png
@@ -75,7 +75,7 @@ jobs:
 
       - name: Bundle desktop release
         working-directory: ${{ github.workspace }}
-        run: dx bundle --platform desktop --release
+        run: dx bundle --platform desktop --package-types deb --package-types rpm --release
 
       - name: Package bundles
         run: |
@@ -88,7 +88,7 @@ jobs:
 
           mkdir -p staging
           find "$BUNDLE_DIR" -maxdepth 2 -type f \
-            \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \) \
+            \( -name "*.deb" -o -name "*.rpm" \) \
             -exec cp {} staging/ \;
 
           if [ -z "$(find staging -maxdepth 1 -type f -print -quit)" ]; then
@@ -113,7 +113,6 @@ jobs:
           files: |
             staging/*.deb
             staging/*.rpm
-            staging/*.AppImage
 
   bundle-windows:
     runs-on: windows-latest
@@ -142,7 +141,7 @@ jobs:
         run: cargo binstall dioxus-cli --force
 
       - name: Bundle desktop release
-        run: dx bundle --platform desktop --release
+        run: dx bundle --platform desktop --package-types nsis --release
 
       - name: Package bundles
         shell: pwsh

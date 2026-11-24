@@ -25,3 +25,6 @@ script = []
 identifier = "com.pkjinfinity.xsensor"
 publisher = "pkjinfinity"
 icon = ["icons/icon.ico", "icons/icon.png"]
+
+[bundle.windows]
+webview_install_mode = { DownloadBootstrapper = { silent = true } }
