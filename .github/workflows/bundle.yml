@@ -30,7 +30,7 @@ jobs:
           key: dioxus-cli-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Install system dependencies
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
