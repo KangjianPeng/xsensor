@@ -30,9 +30,10 @@ jobs:
           key: dioxus-cli-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Install system dependencies
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
