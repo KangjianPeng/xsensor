@@ -114,7 +114,7 @@ jobs:
   bundle-windows:
     runs-on: windows-latest
     env:
-      BUNDLE_DIR: target/dx/xsensor/bundle/windows/bundle
+      BUNDLE_DIR: target/dx/xsensor/bundle/windows/nsis
       BUNDLE_ARCHIVE: ${{ github.event.repository.name }}-windows.zip
       BUNDLE_ARTIFACT_NAME: ${{ github.event.repository.name }}-windows-bundle
     steps:
