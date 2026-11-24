@@ -118,6 +118,8 @@ jobs:
     runs-on: windows-latest
     env:
       BUNDLE_DIR: target/dx/xsensor/bundle/windows/nsis
+      PORTABLE_DIR: target/dx/xsensor/release/windows/app
+      PORTABLE_ARCHIVE: ${{ github.event.repository.name }}-windows-portable.zip
       BUNDLE_ARTIFACT_NAME: ${{ github.event.repository.name }}-windows-bundle
     steps:
       - name: Checkout sources
@@ -151,16 +153,30 @@ jobs:
             exit 1
           }
 
-          New-Item -ItemType Directory -Force -Path staging | Out-Null
-          Get-ChildItem -Path $env:BUNDLE_DIR -Recurse -File |
-            Where-Object { $_.Extension -in @('.exe', '.msi') } |
-            Copy-Item -Destination staging
+          $stagingDirectory = Join-Path $PWD 'staging'
+          New-Item -ItemType Directory -Force -Path $stagingDirectory | Out-Null
 
-          $packages = Get-ChildItem -Path staging -File
-          if ($packages.Count -eq 0) {
-            Write-Error "No final Windows packages were produced."
+          $installers = Get-ChildItem -Path $env:BUNDLE_DIR -File -Filter '*-setup.exe'
+          if ($installers.Count -eq 0) {
+            Write-Error "No top-level NSIS installer was produced in $env:BUNDLE_DIR."
             exit 1
           }
+          $installers | Copy-Item -Destination $stagingDirectory
+
+          $portableExecutable = Join-Path $env:PORTABLE_DIR 'xsensor.exe'
+          $portableAssets = Join-Path $env:PORTABLE_DIR 'assets'
+          if (!(Test-Path -Path $portableExecutable) -or !(Test-Path -Path $portableAssets)) {
+            Write-Error "Portable executable or assets are missing from $env:PORTABLE_DIR."
+            exit 1
+          }
+
+          $portableStaging = Join-Path $PWD 'portable'
+          New-Item -ItemType Directory -Force -Path $portableStaging | Out-Null
+          Copy-Item -Path (Join-Path $env:PORTABLE_DIR '*') -Destination $portableStaging -Recurse -Force
+          $portableArchive = Join-Path $stagingDirectory $env:PORTABLE_ARCHIVE
+          Compress-Archive -Path (Join-Path $portableStaging '*') -DestinationPath $portableArchive -CompressionLevel Optimal
+
+          $packages = Get-ChildItem -Path staging -File
 
           Write-Host "Final artifacts:"
           $packages | Format-Table Name,Length
@@ -178,4 +194,4 @@ jobs:
         with:
           files: |
             staging/*.exe
-            staging/*.msi
+            staging/*.zip
