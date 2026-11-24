@@ -15,7 +15,7 @@ jobs:
   bundle-linux:
     runs-on: ubuntu-24.04
     env:
-      BUNDLE_DIR: target/dx/xsensor/bundle/linux/bundle
+      BUNDLE_DIR: target/dx/xsensor/bundle/linux
       BUNDLE_ARCHIVE: ${{ github.event.repository.name }}-linux.tar.gz
       BUNDLE_ARTIFACT_NAME: ${{ github.event.repository.name }}-linux-bundle
     steps:
